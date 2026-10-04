@@ -2830,7 +2830,11 @@ export default function(pi: ExtensionAPI) {
       ),
    });
 
+   // Asks the user, so only the model may call it; codemode scripts cannot open prompts. Pi types `exposure` from
+   // 1.0 and older hosts ignore it, so it is spread in to keep the definition valid against every supported host.
+   const modelOnly: Record<string, unknown> = { exposure: "model-only" };
    pi.registerTool({
+      ...modelOnly,
       name: "ask_user",
       label: "Ask User",
       description:
