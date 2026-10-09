@@ -13,7 +13,7 @@ import type {
    ExtensionUIContext,
    Theme,
 } from "@earendil-works/pi-coding-agent";
-import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Type, type TUnsafe } from "@sinclair/typebox";
 import {
    Container,
@@ -42,6 +42,18 @@ import {
 import { renderSingleSelectRows, type QuestionOption } from "./single-select-layout";
 
 import { createRequire } from "node:module";
+import { join } from "node:path";
+import {
+   ASK_USER_DEFAULTS,
+   ASK_USER_SETTING_KEYS,
+   ASK_USER_SETTINGS_FILENAME,
+   AskUserSettingsStore,
+   isValidShortcutSpec,
+   normalizeShortcutSpec,
+   parseSettingValue,
+   type AskUserConfig,
+   type AskUserSettingKey,
+} from "./ask-user-settings";
 const _require = createRequire(import.meta.url);
 const ASK_USER_VERSION: string = (_require("./package.json") as { version: string }).version;
 
@@ -121,167 +133,110 @@ function safeMarkdownTheme(): MarkdownTheme | undefined {
    }
 }
 
-type AskOptionInput = QuestionOption | string;
-
 type AskDisplayMode = "overlay" | "inline";
 type AskSingleSelectLayout = "auto" | "list";
 
+/** One option as the model supplies it. `label` is the answer value. */
+interface OptionInput {
+   label: string;
+   description: string;
+   preview?: string;
+}
+
 interface BatchQuestionInput {
    question: string;
-   context?: string;
-   options?: AskOptionInput[];
-   allowMultiple?: boolean;
-   allowFreeform?: boolean;
+   header: string;
+   options: OptionInput[];
+   multiSelect?: boolean;
 }
 
 interface AskParams {
-   question?: string;
-   questions?: BatchQuestionInput[];
-   context?: string;
-   options?: AskOptionInput[];
-   allowMultiple?: boolean;
-   allowFreeform?: boolean;
-   allowComment?: boolean;
-   displayMode?: AskDisplayMode;
-   singleSelectLayout?: AskSingleSelectLayout;
-   contextExpanded?: boolean;
-   overlayToggleKey?: string | null;
-   commentToggleKey?: string | null;
-   timeout?: number;
+   questions: BatchQuestionInput[];
 }
 
-type AskResponse =
-   | {
-      kind: "selection";
-      selections: string[];
-      comment?: string;
-   }
-   | {
-      kind: "freeform";
-      text: string;
-   };
+type AskAnswerKind = "option" | "custom" | "multi";
 
-interface AskToolDetails {
+/**
+ * One answer. `option` carries the chosen label in `answer`, `custom` the
+ * free text the user typed, and `multi` `null` with the labels in `selected`.
+ */
+interface AskAnswer {
    question: string;
-   context?: string;
-   options: QuestionOption[];
-   response: AskResponse | null;
+   kind: AskAnswerKind;
+   answer: string | null;
+   selected?: string[];
+}
+
+/** Answer without its question text, as it moves through the prompt UI. */
+type AskUIResponse = Omit<AskAnswer, "question">;
+
+/** Tool result details for every call. */
+interface AskResultDetails {
+   answers: AskAnswer[];
    cancelled: boolean;
+   error?: string;
 }
 
 /** One validated entry of a `questions` batch. */
 interface BatchQuestion {
    question: string;
-   context?: string;
+   header: string;
    options: QuestionOption[];
-   allowMultiple: boolean;
-   allowFreeform: boolean;
+   multiSelect: boolean;
 }
 
-type BatchAnswer = { status: "answered"; response: AskResponse } | { status: "skipped" };
-
-/** Result details of a `questions` batch. Single-question results keep AskToolDetails. */
-interface AskBatchDetails {
-   kind: "batch";
-   questions: Array<{ question: string; context?: string; options: QuestionOption[] }>;
-   /** Index-aligned with `questions`; empty when the batch was cancelled. */
-   answers: BatchAnswer[];
-   cancelled: boolean;
-}
-
-function isBatchDetails<T extends AskToolDetails | AskBatchDetails>(details: T): details is Extract<T, AskBatchDetails> {
-   return (details as AskBatchDetails).kind === "batch";
-}
-
-const BATCH_MIN_QUESTIONS = 2;
+const BATCH_MIN_QUESTIONS = 1;
 const BATCH_MAX_QUESTIONS = 4;
-// Single-question fields that a batch sets per entry instead of at the top level.
-const BATCH_ENTRY_FIELDS = ["context", "options", "allowMultiple", "allowFreeform"] as const;
+const BATCH_MIN_OPTIONS = 2;
+const BATCH_MAX_OPTIONS = 4;
+/** Labels the prompt UI reserves for its own rows, so models may not use them. */
+const RESERVED_OPTION_LABELS = ["Other", "Type something.", "Next"] as const;
+// Removed top-level fields: every question's data belongs inside questions.
+const BATCH_ENTRY_FIELDS = ["question", "header", "options", "multiSelect"] as const;
 
-type AskUIResult = AskResponse;
-
-// Key aliases models fall back to when a schema-mangling proxy (Google
-// function calling, Codex-style backends, cmux) strips the option shape and
-// the model has to guess. See issue #22.
-const OPTION_TITLE_KEYS = ["title", "label", "text", "value", "name", "option"] as const;
+type AskUIResult = AskUIResponse;
 
 function coerceOption(option: unknown): QuestionOption | null {
-   if (typeof option === "string" || typeof option === "number" || typeof option === "boolean") {
-      const title = String(option).trim();
-      return title ? { title } : null;
-   }
-   if (option && typeof option === "object") {
-      const record = option as Record<string, unknown>;
-      for (const key of OPTION_TITLE_KEYS) {
-         const value = record[key];
-         if (typeof value === "string" && value.trim()) {
-            const description =
-               typeof record.description === "string" && record.description.trim() ? record.description : undefined;
-            return description ? { title: value.trim(), description } : { title: value.trim() };
-         }
-      }
-   }
-   return null;
+   if (!option || typeof option !== "object") return null;
+   const record = option as Record<string, unknown>;
+   // Both label and description are required by the schema; a missing or
+   // non-string value makes the whole option malformed.
+   const label = typeof record.label === "string" ? record.label.trim() : "";
+   if (!label) return null;
+   if (typeof record.description !== "string") return null;
+   const description = record.description;
+   const preview = typeof record.preview === "string" && record.preview.trim() ? record.preview : undefined;
+   return preview ? { label, description, preview } : { label, description };
 }
 
 function formatOptionsForMessage(options: QuestionOption[]): string {
    return options
       .map((option, index) => {
          const desc = option.description ? ` — ${option.description}` : "";
-         return `${index + 1}. ${option.title}${desc}`;
+         return `${index + 1}. ${option.label}${desc}`;
       })
       .join("\n");
 }
 
-function normalizeOptionalComment(text: string | null | undefined): string | undefined {
+function createCustomResponse(text: string | null | undefined): AskUIResponse | null {
    const trimmed = text?.trim();
-   return trimmed ? trimmed : undefined;
+   return trimmed ? { kind: "custom", answer: trimmed } : null;
 }
 
-function parseBooleanPreference(value: string | undefined): boolean | undefined {
-   if (value === undefined) return undefined;
-   switch (value.trim().toLowerCase()) {
-      case "1":
-      case "true":
-      case "yes":
-      case "on":
-         return true;
-      case "0":
-      case "false":
-      case "no":
-      case "off":
-         return false;
-      default:
-         return undefined;
-   }
+function createOptionResponse(label: string): AskUIResponse | null {
+   const trimmed = label.trim();
+   return trimmed ? { kind: "option", answer: trimmed } : null;
 }
 
-function createFreeformResponse(text: string | null | undefined): AskResponse | null {
-   const trimmed = text?.trim();
-   return trimmed ? { kind: "freeform", text: trimmed } : null;
+function createMultiResponse(labels: string[]): AskUIResponse | null {
+   const selected = labels.map((label) => label.trim()).filter(Boolean);
+   if (selected.length === 0) return null;
+   return { kind: "multi", answer: null, selected };
 }
 
-function createSelectionResponse(selections: string[], comment?: string | null): AskResponse | null {
-   const normalizedSelections = selections.map((selection) => selection.trim()).filter(Boolean);
-   if (normalizedSelections.length === 0) return null;
-
-   const normalizedComment = normalizeOptionalComment(comment);
-   return normalizedComment
-      ? { kind: "selection", selections: normalizedSelections, comment: normalizedComment }
-      : { kind: "selection", selections: normalizedSelections };
-}
-
-function formatResponseSummary(response: AskResponse): string {
-   if (response.kind === "freeform") return response.text;
-
-   const selections = response.selections.join(", ");
-   return response.comment ? `${selections} — ${response.comment}` : selections;
-}
-
-function buildCommentPrompt(prompt: string, selections: string[]): string {
-   const label = selections.length === 1 ? "Selected option" : "Selected options";
-   const lines = selections.map((selection) => `- ${selection}`).join("\n");
-   return `${prompt}\n\n${label}:\n${lines}`;
+function formatResponseSummary(response: AskUIResponse): string {
+   if (response.kind === "multi") return response.selected?.join(", ") ?? "";
+   return response.answer ?? "";
 }
 
 function parseDialogSelections(input: string): string[] {
@@ -293,10 +248,6 @@ function parseDialogSelections(input: string): string[] {
 
 function isCancelledInput(value: unknown): value is null | undefined {
    return value === null || value === undefined;
-}
-
-function isSelectionResponse(response: AskResponse): response is Extract<AskResponse, { kind: "selection" }> {
-   return response.kind === "selection";
 }
 
 function createSelectListTheme(theme: Theme) {
@@ -391,7 +342,6 @@ type ResolvedShortcut =
 
 interface ResolvedAskShortcuts {
    overlayToggle: ResolvedShortcut;
-   commentToggle: ResolvedShortcut;
 }
 
 const DISABLED_SHORTCUT: ResolvedShortcut = {
@@ -399,26 +349,6 @@ const DISABLED_SHORTCUT: ResolvedShortcut = {
    spec: null,
    matches: ((_data: string) => false) as (data: string) => false,
 };
-
-const SHORTCUT_DISABLE_VALUES = new Set(["off", "none", "disabled", ""]);
-
-function normalizeShortcutSpec(value: string | null | undefined): string | null | undefined {
-   if (value === undefined) return undefined;
-   if (value === null) return null;
-   const trimmed = value.trim().toLowerCase();
-   if (SHORTCUT_DISABLE_VALUES.has(trimmed)) return null;
-   return trimmed;
-}
-
-function isValidShortcutSpec(spec: string): boolean {
-   // KeyId is canonical lowercase: modifiers (`ctrl|shift|alt|super`) joined by `+`,
-   // plus a base key. We do a light syntactic sanity check; matchesKey() does the rest.
-   if (!spec) return false;
-   if (!/^[a-z0-9+_\-!@#$%^&*()|~`'":;,./<>?[\]{}=\\]+$/i.test(spec)) return false;
-   if (spec.startsWith("+") || spec.endsWith("+")) return false;
-   if (spec.includes("++")) return false;
-   return true;
-}
 
 function buildShortcut(spec: string): ResolvedShortcut {
    return {
@@ -429,11 +359,11 @@ function buildShortcut(spec: string): ResolvedShortcut {
 }
 
 function resolveShortcut(
-   paramValue: string | null | undefined,
+   configValue: string | null | undefined,
    envValue: string | undefined,
    defaultSpec: string,
 ): ResolvedShortcut {
-   const candidates: Array<string | null | undefined> = [paramValue, envValue, defaultSpec];
+   const candidates: Array<string | null | undefined> = [configValue, envValue, defaultSpec];
    for (const raw of candidates) {
       const normalized = normalizeShortcutSpec(raw);
       if (normalized === undefined) continue; // not provided, fall through
@@ -444,7 +374,7 @@ function resolveShortcut(
    return DISABLED_SHORTCUT;
 }
 
-type AskMode = "select" | "freeform" | "comment";
+type AskMode = "select" | "freeform";
 
 const ASK_OVERLAY_MAX_HEIGHT_RATIO = 0.85;
 const ASK_OVERLAY_MIN_RENDER_LINES = 8;
@@ -455,11 +385,7 @@ const SINGLE_SELECT_SPLIT_PANE_LEFT_MIN_WIDTH = 32;
 const SINGLE_SELECT_SPLIT_PANE_RIGHT_MIN_WIDTH = 28;
 const SINGLE_SELECT_SPLIT_PANE_SEPARATOR = " │ ";
 const FREEFORM_SENTINEL = "\u270f\ufe0f Type custom response...";
-const COMMENT_TOGGLE_LABEL = "Add extra context after selection";
 const DEFAULT_OVERLAY_TOGGLE_KEY = "alt+o";
-const DEFAULT_COMMENT_TOGGLE_KEY = "ctrl+g";
-const CONTEXT_TOGGLE_KEYS = [Key.ctrl("e"), Key.ctrl("x"), Key.ctrl("y")];
-const INLINE_CONTEXT_MAX_ROWS = 3;
 
 // Vim-style aliases for navigating option lists. ctrl+j/k are safe in the
 // searchable single-select because they don't collide with fuzzy-search input.
@@ -535,14 +461,10 @@ function buildCustomUIOptions(
 
 class MultiSelectList implements Component {
    private options: QuestionOption[];
-   private allowFreeform: boolean;
-   private allowComment: boolean;
    private theme: Theme;
    private keybindings: KeybindingsManager;
-   private commentToggle: ResolvedShortcut;
    private selectedIndex = 0;
    private checked = new Set<number>();
-   private commentEnabled = false;
    private maxVisibleRows = 10;
    private cachedWidth?: number;
    private cachedLines?: string[];
@@ -553,22 +475,12 @@ class MultiSelectList implements Component {
 
    constructor(
       options: QuestionOption[],
-      allowFreeform: boolean,
-      allowComment: boolean,
       theme: Theme,
       keybindings: KeybindingsManager,
-      commentToggle: ResolvedShortcut,
    ) {
       this.options = options;
-      this.allowFreeform = allowFreeform;
-      this.allowComment = allowComment;
       this.theme = theme;
       this.keybindings = keybindings;
-      this.commentToggle = commentToggle;
-   }
-
-   public isCommentEnabled(): boolean {
-      return this.commentEnabled;
    }
 
    setMaxVisibleRows(rows: number): void {
@@ -585,36 +497,21 @@ class MultiSelectList implements Component {
    }
 
    private getItemCount(): number {
-      return this.options.length + (this.allowComment ? 1 : 0) + (this.allowFreeform ? 1 : 0);
-   }
-
-   private getCommentToggleIndex(): number | null {
-      return this.allowComment ? this.options.length : null;
+      return this.options.length + 1;
    }
 
    private getFreeformIndex(): number {
-      return this.options.length + (this.allowComment ? 1 : 0);
-   }
-
-   private isCommentToggleRow(index: number): boolean {
-      const toggleIndex = this.getCommentToggleIndex();
-      return toggleIndex !== null && index === toggleIndex;
+      return this.options.length;
    }
 
    private isFreeformRow(index: number): boolean {
-      return this.allowFreeform && index === this.getFreeformIndex();
+      return index === this.getFreeformIndex();
    }
 
    private toggle(index: number): void {
       if (index < 0 || index >= this.options.length) return;
       if (this.checked.has(index)) this.checked.delete(index);
       else this.checked.add(index);
-   }
-
-   private toggleComment(): void {
-      if (!this.allowComment) return;
-      this.commentEnabled = !this.commentEnabled;
-      this.invalidate();
    }
 
    handleInput(data: string): void {
@@ -626,11 +523,6 @@ class MultiSelectList implements Component {
       const count = this.getItemCount();
       if (count === 0) {
          this.onCancel?.();
-         return;
-      }
-
-      if (this.allowComment && !this.commentToggle.disabled && this.commentToggle.matches(data)) {
-         this.toggleComment();
          return;
       }
 
@@ -658,10 +550,6 @@ class MultiSelectList implements Component {
       }
 
       if (matchesKey(data, Key.space)) {
-         if (this.isCommentToggleRow(this.selectedIndex)) {
-            this.toggleComment();
-            return;
-         }
          if (this.isFreeformRow(this.selectedIndex)) {
             this.onEnterFreeform?.();
             return;
@@ -672,22 +560,18 @@ class MultiSelectList implements Component {
       }
 
       if (this.keybindings.matches(data, "tui.select.confirm")) {
-         if (this.isCommentToggleRow(this.selectedIndex)) {
-            this.toggleComment();
-            return;
-         }
          if (this.isFreeformRow(this.selectedIndex)) {
             this.onEnterFreeform?.();
             return;
          }
 
-         const selectedTitles = Array.from(this.checked)
+         const selectedLabels = Array.from(this.checked)
             .sort((a, b) => a - b)
-            .map((i) => this.options[i]?.title)
+            .map((i) => this.options[i]?.label)
             .filter((t): t is string => !!t);
 
-         const fallback = this.options[this.selectedIndex]?.title;
-         const result = selectedTitles.length > 0 ? selectedTitles : fallback ? [fallback] : [];
+         const fallback = this.options[this.selectedIndex]?.label;
+         const result = selectedLabels.length > 0 ? selectedLabels : fallback ? [fallback] : [];
 
          if (result.length > 0) this.onSubmit?.(result);
          else this.onCancel?.();
@@ -715,16 +599,6 @@ class MultiSelectList implements Component {
          const prefix = isSelected ? theme.fg("accent", "→") : " ";
          const block: string[] = [];
 
-         if (this.isCommentToggleRow(i)) {
-            const checkbox = this.commentEnabled ? theme.fg("success", "[✓]") : theme.fg("dim", "[ ]");
-            const label = isSelected
-               ? theme.fg("accent", theme.bold(COMMENT_TOGGLE_LABEL))
-               : theme.fg("text", theme.bold(COMMENT_TOGGLE_LABEL));
-            block.push(truncateToWidth(`${prefix}   ${checkbox} ${label}`, width, ""));
-            blocks.push(block);
-            continue;
-         }
-
          if (this.isFreeformRow(i)) {
             const label = theme.fg("text", theme.bold("Type something."));
             const desc = theme.fg("muted", "Enter a custom response");
@@ -739,8 +613,8 @@ class MultiSelectList implements Component {
          const checkbox = this.checked.has(i) ? theme.fg("success", "[✓]") : theme.fg("dim", "[ ]");
          const num = theme.fg("dim", `${i + 1}.`);
          const title = isSelected
-            ? theme.fg("accent", theme.bold(option.title))
-            : theme.fg("text", theme.bold(option.title));
+            ? theme.fg("accent", theme.bold(option.label))
+            : theme.fg("text", theme.bold(option.label));
 
          const firstLine = `${prefix} ${num} ${checkbox} ${title}`;
          block.push(truncateToWidth(firstLine, width, ""));
@@ -808,15 +682,11 @@ class MultiSelectList implements Component {
 
 class WrappedSingleSelectList implements Component {
    private options: QuestionOption[];
-   private allowFreeform: boolean;
-   private allowComment: boolean;
    private theme: Theme;
    private singleSelectLayout: AskSingleSelectLayout;
    private keybindings: KeybindingsManager;
-   private commentToggle: ResolvedShortcut;
    private selectedIndex = 0;
    private searchQuery = "";
-   private commentEnabled = false;
    private maxVisibleRows = 12;
    private cachedWidth?: number;
    private cachedLines?: string[];
@@ -827,24 +697,14 @@ class WrappedSingleSelectList implements Component {
 
    constructor(
       options: QuestionOption[],
-      allowFreeform: boolean,
-      allowComment: boolean,
       theme: Theme,
       singleSelectLayout: AskSingleSelectLayout,
       keybindings: KeybindingsManager,
-      commentToggle: ResolvedShortcut,
    ) {
       this.options = options;
-      this.allowFreeform = allowFreeform;
-      this.allowComment = allowComment;
       this.theme = theme;
       this.singleSelectLayout = singleSelectLayout;
       this.keybindings = keybindings;
-      this.commentToggle = commentToggle;
-   }
-
-   public isCommentEnabled(): boolean {
-      return this.commentEnabled;
    }
 
    setMaxVisibleRows(rows: number): void {
@@ -861,25 +721,15 @@ class WrappedSingleSelectList implements Component {
    }
 
    private getFilteredOptions(): QuestionOption[] {
-      return fuzzyFilter(this.options, this.searchQuery, (option) => `${option.title} ${option.description ?? ""}`);
+      return fuzzyFilter(this.options, this.searchQuery, (option) => `${option.label} ${option.description ?? ""}`);
    }
 
    private getItemCount(filteredOptions: QuestionOption[]): number {
-      return filteredOptions.length + (this.allowComment ? 1 : 0) + (this.allowFreeform ? 1 : 0);
-   }
-
-   private isCommentToggleRow(index: number, filteredOptions: QuestionOption[]): boolean {
-      return this.allowComment && index === filteredOptions.length;
+      return filteredOptions.length + 1;
    }
 
    private isFreeformRow(index: number, filteredOptions: QuestionOption[]): boolean {
-      return this.allowFreeform && index === filteredOptions.length + (this.allowComment ? 1 : 0);
-   }
-
-   private toggleComment(): void {
-      if (!this.allowComment) return;
-      this.commentEnabled = !this.commentEnabled;
-      this.invalidate();
+      return index === filteredOptions.length;
    }
 
    private setSearchQuery(query: string): void {
@@ -977,9 +827,6 @@ class WrappedSingleSelectList implements Component {
          options: filteredOptions,
          selectedIndex: this.selectedIndex,
          width,
-         allowFreeform: this.allowFreeform,
-         allowComment: this.allowComment,
-         commentEnabled: this.commentEnabled,
          maxRows,
          hideDescriptions,
       });
@@ -996,11 +843,7 @@ class WrappedSingleSelectList implements Component {
 
       let md = "";
 
-      if (this.isCommentToggleRow(this.selectedIndex, filteredOptions)) {
-         md += "## Additional context\n\n";
-         md += `Currently: **${this.commentEnabled ? "Enabled" : "Disabled"}**\n\n`;
-         md += "Turn this on when the selected option needs extra explanation before the tool submits.\n";
-      } else if (this.isFreeformRow(this.selectedIndex, filteredOptions)) {
+      if (this.isFreeformRow(this.selectedIndex, filteredOptions)) {
          md += "## Custom response\n\n";
          md += "Open the editor to write **any** answer.\n\n";
          md += "*Use this when none of the listed options fit.*\n";
@@ -1012,9 +855,10 @@ class WrappedSingleSelectList implements Component {
          if (!selected) {
             md += "*No option selected*\n";
          } else {
-            md += `## ${selected.title}\n\n`;
-            if (selected.description?.trim()) {
-               md += `${selected.description}\n`;
+            md += `## ${selected.label}\n\n`;
+            const detail = selected.preview?.trim() || selected.description?.trim();
+            if (detail) {
+               md += `${detail}\n`;
             } else {
                md += "*No additional details provided for this option.*\n";
             }
@@ -1059,11 +903,6 @@ class WrappedSingleSelectList implements Component {
          return;
       }
 
-      if (this.allowComment && !this.commentToggle.disabled && this.commentToggle.matches(data)) {
-         this.toggleComment();
-         return;
-      }
-
       const filteredOptions = this.getFilteredOptions();
       const count = this.getItemCount(filteredOptions);
 
@@ -1089,22 +928,13 @@ class WrappedSingleSelectList implements Component {
          }
       }
 
-      if (matchesKey(data, Key.space) && count > 0 && this.isCommentToggleRow(this.selectedIndex, filteredOptions)) {
-         this.toggleComment();
-         return;
-      }
-
       if (this.keybindings.matches(data, "tui.select.confirm") && count > 0) {
-         if (this.isCommentToggleRow(this.selectedIndex, filteredOptions)) {
-            this.toggleComment();
-            return;
-         }
          if (this.isFreeformRow(this.selectedIndex, filteredOptions)) {
             this.onEnterFreeform?.();
             return;
          }
 
-         const result = filteredOptions[this.selectedIndex]?.title;
+         const result = filteredOptions[this.selectedIndex]?.label;
          if (result) this.onSubmit?.(result);
          else this.onCancel?.();
          return;
@@ -1159,14 +989,11 @@ class WrappedSingleSelectList implements Component {
  */
 class AskComponent extends Container {
    private question: string;
-   private context?: string;
+   private header: string;
    private options: QuestionOption[];
-   private allowMultiple: boolean;
-   private allowFreeform: boolean;
-   private allowComment: boolean;
+   private multiSelect: boolean;
    private displayMode: AskDisplayMode;
    private singleSelectLayout: AskSingleSelectLayout;
-   private preferExpandedContext: boolean;
    private tui: TUI;
    private theme: Theme;
    private keybindings: KeybindingsManager;
@@ -1174,22 +1001,17 @@ class AskComponent extends Container {
    private onDone: (result: AskUIResult | null) => void;
 
    private mode: AskMode = "select";
-   private pendingSelections: string[] = [];
    private freeformDraft = "";
-   private commentDraft = "";
    private promptScrollOffset = 0;
    private promptMaxScrollOffset = 0;
    private promptViewportRows = 0;
-   private contextIsCollapsible = false;
-   private contextExpanded = false;
    // A batch page shows its position in the frame title and a navigation hint.
-   private frameTitle = "ask_user";
+   private frameTitle = "ask_user_question";
    private navigationHint: string | null = null;
 
    // Static layout components
    private titleText: Text;
    private questionText: Text;
-   private contextComponent?: Component;
    private modeContainer: Container;
    private helpText: Text;
 
@@ -1205,21 +1027,18 @@ class AskComponent extends Container {
    }
    set focused(value: boolean) {
       this._focused = value;
-      if (this.editor && (this.mode === "freeform" || this.mode === "comment")) {
+      if (this.editor && this.mode === "freeform") {
          (this.editor as any).focused = value;
       }
    }
 
    constructor(
       question: string,
-      context: string | undefined,
+      header: string,
       options: QuestionOption[],
-      allowMultiple: boolean,
-      allowFreeform: boolean,
-      allowComment: boolean,
+      multiSelect: boolean,
       displayMode: AskDisplayMode,
       singleSelectLayout: AskSingleSelectLayout,
-      contextExpanded: boolean,
       tui: TUI,
       theme: Theme,
       keybindings: KeybindingsManager,
@@ -1229,14 +1048,11 @@ class AskComponent extends Container {
       super();
 
       this.question = question;
-      this.context = context;
+      this.header = header;
       this.options = options;
-      this.allowMultiple = allowMultiple;
-      this.allowFreeform = allowFreeform;
-      this.allowComment = allowComment;
+      this.multiSelect = multiSelect;
       this.displayMode = displayMode;
       this.singleSelectLayout = singleSelectLayout;
-      this.preferExpandedContext = contextExpanded;
       this.tui = tui;
       this.theme = theme;
       this.keybindings = keybindings;
@@ -1246,7 +1062,7 @@ class AskComponent extends Container {
       // Layout skeleton
       this.addChild(new BoxBorderTop(
          (s: string) => theme.fg("accent", s),
-         "ask_user",
+         "ask_user_question",
          (s: string) => theme.fg("dim", theme.bold(s)),
       ));
       this.addChild(new Spacer(1));
@@ -1257,17 +1073,6 @@ class AskComponent extends Container {
 
       this.questionText = new Text("", 1, 0);
       this.addChild(this.questionText);
-
-      if (this.context) {
-         this.addChild(new Spacer(1));
-         const mdTheme = safeMarkdownTheme();
-         if (mdTheme) {
-            this.contextComponent = new Markdown("", 1, 0, mdTheme);
-         } else {
-            this.contextComponent = new Text("", 1, 0);
-         }
-         this.addChild(this.contextComponent);
-      }
 
       this.addChild(new Spacer(1));
 
@@ -1286,13 +1091,7 @@ class AskComponent extends Container {
       ));
 
       this.updateStaticText();
-      // Batch questions without options open straight in the editor, like
-      // the input dialog a single question without options uses.
-      if (this.options.length === 0) {
-         this.showFreeformMode();
-      } else {
-         this.showSelectMode();
-      }
+      this.showSelectMode();
    }
 
    override invalidate(): void {
@@ -1308,7 +1107,7 @@ class AskComponent extends Container {
          return this.renderOverlayLayout(width, innerWidth);
       }
 
-      if (this.mode === "select" && !this.allowMultiple) {
+      if (this.mode === "select" && !this.multiSelect) {
          this.ensureSingleSelectList().setMaxVisibleRows(12);
       }
 
@@ -1316,13 +1115,8 @@ class AskComponent extends Container {
    }
 
    private renderInlineLayout(width: number, innerWidth: number): string[] {
-      const fullContextLines = this.buildFullContextLines(innerWidth);
-      this.setContextIsCollapsible(fullContextLines.length > INLINE_CONTEXT_MAX_ROWS);
-      if (this.contextExpanded) {
-         return this.renderOverlayLayout(width, innerWidth);
-      }
       const bodyLines = [
-         ...this.buildPromptLines(innerWidth, fullContextLines),
+         ...this.buildPromptLines(innerWidth),
          "",
          ...this.modeContainer.render(innerWidth),
          "",
@@ -1342,22 +1136,8 @@ class AskComponent extends Container {
       if (maxLines === 2) return [this.renderTopBorder(width), this.renderBottomBorder(width)];
 
       const bodyCapacity = Math.max(0, maxLines - 2);
-      let helpFullLines = this.helpText.render(innerWidth);
-      const questionLines = this.buildQuestionLines(innerWidth);
-      const fullContextLines = this.buildFullContextLines(innerWidth);
-      const shouldCollapse = this.displayMode === "inline"
-         ? this.contextIsCollapsible
-         : this.mode === "select"
-            ? this.shouldCollapseContextForOverlay(
-               questionLines.length,
-               fullContextLines.length,
-               bodyCapacity,
-               helpFullLines.length,
-            )
-            : this.contextIsCollapsible;
-      this.setContextIsCollapsible(shouldCollapse);
-      helpFullLines = this.helpText.render(innerWidth);
-      const promptLines = this.buildPromptLines(innerWidth, fullContextLines);
+      const helpFullLines = this.helpText.render(innerWidth);
+      const promptLines = this.buildPromptLines(innerWidth);
       const helpBudget = this.getOverlayHelpBudget(bodyCapacity, helpFullLines.length);
       const contentRows = Math.max(0, bodyCapacity - helpBudget);
 
@@ -1378,7 +1158,7 @@ class AskComponent extends Container {
             modeBudget = Math.max(modeMinRows, modeBudget);
             promptBudget = promptAndModeRows - modeBudget;
 
-            const usefulPromptTarget = this.contextIsCollapsible && !this.contextExpanded ? 3 : 2;
+            const usefulPromptTarget = 2;
             const usefulPromptRows = Math.min(
                promptLines.length,
                promptAndModeRows >= modeMinRows + usefulPromptTarget ? usefulPromptTarget : promptMinRows,
@@ -1420,62 +1200,10 @@ class AskComponent extends Container {
       return this.questionText.render(width);
    }
 
-   private buildFullContextLines(width: number): string[] {
-      if (!this.contextComponent) return [];
-      return this.contextComponent.render(width);
-   }
-
-   private setContextIsCollapsible(value: boolean): void {
-      if (this.contextIsCollapsible === value) return;
-      this.contextIsCollapsible = value;
-      // Whenever context becomes collapsible (first render, or a resize that
-      // shrinks the viewport) start in the user's preferred state; ctrl+e still
-      // toggles from there.
-      this.contextExpanded = value && this.preferExpandedContext;
-      this.updateHelpText();
-   }
-
-   private getContextToggleKey(): string {
-      const reserved = new Set(
-         [this.shortcuts.overlayToggle, this.shortcuts.commentToggle]
-            .filter((shortcut) => !shortcut.disabled)
-            .map((shortcut) => shortcut.spec),
-      );
-      return CONTEXT_TOGGLE_KEYS.find((key) => !reserved.has(key)) ?? CONTEXT_TOGGLE_KEYS[0]!;
-   }
-
-   private buildContextDisplayLines(fullContextLines: string[], width: number): string[] {
-      if (fullContextLines.length === 0) return [];
-      if (!this.contextIsCollapsible || this.contextExpanded) return fullContextLines;
-      const label = `Context (${fullContextLines.length} lines) — ${this.getContextToggleKey()} expand`;
-      return [truncateToWidth(this.theme.fg("dim", label), width, "")];
-   }
-
-   private buildPromptLines(width: number, fullContextLines: string[]): string[] {
+   private buildPromptLines(width: number): string[] {
+      const headerLines = this.titleText.render(width);
       const questionLines = this.buildQuestionLines(width);
-      const contextLines = this.buildContextDisplayLines(fullContextLines, width);
-      const contextSeparator = this.contextIsCollapsible && !this.contextExpanded ? [] : [""];
-      return [
-         ...questionLines,
-         ...(contextLines.length > 0 ? [...contextSeparator, ...contextLines] : []),
-      ];
-   }
-
-   private shouldCollapseContextForOverlay(
-      questionRows: number,
-      contextRows: number,
-      bodyCapacity: number,
-      helpRows: number,
-   ): boolean {
-      if (contextRows === 0) return false;
-      const helpBudget = this.getOverlayHelpBudget(bodyCapacity, helpRows);
-      const contentRows = Math.max(0, bodyCapacity - helpBudget);
-      const separatorRows = contentRows >= 4 ? 1 : 0;
-      const promptCapacity = Math.max(
-         0,
-         contentRows - separatorRows - this.getMinimumModeRows(),
-      );
-      return questionRows + 1 + contextRows > promptCapacity;
+      return [...headerLines, "", ...questionLines];
    }
 
    private getOverlayHelpBudget(bodyCapacity: number, renderedHelpRows: number): number {
@@ -1486,13 +1214,11 @@ class AskComponent extends Container {
 
    private getMinimumModeRows(): number {
       if (this.mode === "freeform") return 5;
-      if (this.mode === "comment") return 6;
       return 3;
    }
 
    private getPreferredModeRows(): number {
       if (this.mode === "freeform") return 10;
-      if (this.mode === "comment") return 11;
       return 8;
    }
 
@@ -1501,7 +1227,7 @@ class AskComponent extends Container {
       if (safeBudget <= 0) return [];
 
       if (this.mode === "select") {
-         if (this.allowMultiple) {
+         if (this.multiSelect) {
             this.ensureMultiSelectList().setMaxVisibleRows(Math.max(1, safeBudget));
          } else {
             this.ensureSingleSelectList().setMaxVisibleRows(Math.max(1, safeBudget));
@@ -1526,15 +1252,6 @@ class AskComponent extends Container {
    }
 
    private buildEditorModeHeaderLines(width: number): string[] {
-      if (this.mode === "comment") {
-         const selectedLabel = this.pendingSelections.length === 1 ? "Selected option:" : "Selected options:";
-         return [
-            ...new Text(this.theme.fg("accent", this.theme.bold(selectedLabel)), 1, 0).render(width),
-            ...new Text(this.theme.fg("text", this.pendingSelections.join(", ")), 1, 0).render(width),
-            "",
-         ];
-      }
-
       return [
          ...new Text(this.theme.fg("accent", this.theme.bold("Custom response")), 1, 0).render(width),
          "",
@@ -1679,20 +1396,8 @@ class AskComponent extends Container {
 
    private updateStaticText(): void {
       const theme = this.theme;
-      const title = this.mode === "comment" ? "Optional comment" : "Question";
-      this.titleText.setText(theme.fg("accent", theme.bold(title)));
+      this.titleText.setText(theme.fg("accent", theme.bold(this.header)));
       this.questionText.setText(theme.fg("text", theme.bold(this.question)));
-      if (this.contextComponent && this.context) {
-         if (this.contextComponent instanceof Markdown) {
-            (this.contextComponent as Markdown).setText(
-               `**Context:**\n${this.context}`,
-            );
-         } else {
-            (this.contextComponent as Text).setText(
-               `${theme.fg("accent", theme.bold("Context:"))}\n${theme.fg("dim", this.context)}`,
-            );
-         }
-      }
    }
 
    private updateHelpText(): void {
@@ -1700,28 +1405,18 @@ class AskComponent extends Container {
       const overlayHint = this.displayMode === "overlay" && !this.shortcuts.overlayToggle.disabled
          ? literalHint(theme, this.shortcuts.overlayToggle.spec, "hide")
          : null;
-      const promptScrollHint = this.displayMode === "overlay" || this.contextExpanded
+      const promptScrollHint = this.displayMode === "overlay"
          ? literalHint(theme, "PgUp/PgDn", "prompt")
          : null;
-      const commentHint = this.allowComment && !this.shortcuts.commentToggle.disabled
-         ? literalHint(theme, this.shortcuts.commentToggle.spec, "toggle context")
-         : null;
-      const contextHint = this.contextIsCollapsible
-         ? literalHint(
-            theme,
-            this.getContextToggleKey(),
-            this.contextExpanded ? "collapse context" : "expand context",
-         )
-         : null;
-      if (this.mode === "freeform" || this.mode === "comment") {
+      if (this.mode === "freeform") {
          const alternateCancelKeys = this.keybindings
             .getKeys("tui.select.cancel")
             .filter((key) => key !== "escape" && key !== "esc");
          const hints = [
             this.navigationHint,
-            keybindingHint(theme, this.keybindings, "tui.input.submit", this.mode === "comment" ? "submit/skip" : "submit"),
+            keybindingHint(theme, this.keybindings, "tui.input.submit", "submit"),
             keybindingHint(theme, this.keybindings, "tui.input.newLine", "newline"),
-            literalHint(theme, "esc", this.options.length === 0 ? "cancel" : "back"),
+            literalHint(theme, "esc", "back"),
             overlayHint,
             alternateCancelKeys.length > 0 ? literalHint(theme, formatKeyList(alternateCancelKeys), "cancel") : null,
          ]
@@ -1731,13 +1426,11 @@ class AskComponent extends Container {
          return;
       }
 
-      if (this.allowMultiple) {
+      if (this.multiSelect) {
          const hints = [
             this.navigationHint,
             literalHint(theme, "↑↓", "navigate"),
             literalHint(theme, "space", "toggle"),
-            commentHint,
-            contextHint,
             promptScrollHint,
             overlayHint,
             keybindingHint(theme, this.keybindings, "tui.select.confirm", "submit"),
@@ -1753,8 +1446,6 @@ class AskComponent extends Container {
          const hints = [
             this.navigationHint,
             literalHint(theme, "type", "filter"),
-            commentHint,
-            contextHint,
             promptScrollHint,
             keybindingHint(theme, this.keybindings, "tui.editor.deleteCharBackward", "erase"),
             literalHint(theme, "↑↓", "navigate"),
@@ -1783,14 +1474,11 @@ class AskComponent extends Container {
 
       const list = new WrappedSingleSelectList(
          this.options,
-         this.allowFreeform,
-         this.allowComment,
          this.theme,
          this.singleSelectLayout,
          this.keybindings,
-         this.shortcuts.commentToggle,
       );
-      list.onSubmit = (result) => this.handleSelectionSubmit([result], list.isCommentEnabled());
+      list.onSubmit = (result) => this.handleOptionSubmit(result);
       list.onCancel = () => this.onDone(null);
       list.onEnterFreeform = () => this.showFreeformMode();
 
@@ -1803,14 +1491,11 @@ class AskComponent extends Container {
 
       const list = new MultiSelectList(
          this.options,
-         this.allowFreeform,
-         this.allowComment,
          this.theme,
          this.keybindings,
-         this.shortcuts.commentToggle,
       );
       list.onCancel = () => this.onDone(null);
-      list.onSubmit = (result) => this.handleSelectionSubmit(result, list.isCommentEnabled());
+      list.onSubmit = (result) => this.handleMultiSubmit(result);
       list.onEnterFreeform = () => this.showFreeformMode();
 
       this.multiSelectList = list;
@@ -1836,8 +1521,6 @@ class AskComponent extends Container {
       const currentText = String(getText.call(this.editor) ?? "");
       if (this.mode === "freeform") {
          this.freeformDraft = currentText;
-      } else if (this.mode === "comment") {
-         this.commentDraft = currentText;
       }
    }
 
@@ -1849,39 +1532,29 @@ class AskComponent extends Container {
       }
    }
 
-   private handleSelectionSubmit(selections: string[], wantsComment: boolean): void {
-      if (this.allowComment && wantsComment) {
-         this.pendingSelections = selections;
-         this.commentDraft = "";
-         this.showCommentMode();
-         return;
-      }
+   private handleOptionSubmit(label: string): void {
+      this.onDone(createOptionResponse(label));
+   }
 
-      this.onDone(createSelectionResponse(selections));
+   private handleMultiSubmit(labels: string[]): void {
+      this.onDone(createMultiResponse(labels));
    }
 
    private handleEditorSubmit(text: string): void {
       if (this.mode === "freeform") {
-         this.onDone(createFreeformResponse(text));
-         return;
-      }
-
-      if (this.mode === "comment") {
-         this.commentDraft = text;
-         this.onDone(createSelectionResponse(this.pendingSelections, text));
+         this.onDone(createCustomResponse(text));
       }
    }
 
    private showSelectMode(): void {
-      if (this.mode === "freeform" || this.mode === "comment") {
+      if (this.mode === "freeform") {
          this.saveEditorDraft();
       }
 
       this.mode = "select";
-      this.pendingSelections = [];
       this.modeContainer.clear();
 
-      if (this.allowMultiple) {
+      if (this.multiSelect) {
          this.modeContainer.addChild(this.ensureMultiSelectList());
       } else {
          this.modeContainer.addChild(this.ensureSingleSelectList());
@@ -1893,10 +1566,6 @@ class AskComponent extends Container {
    }
 
    private showFreeformMode(): void {
-      if (this.mode === "comment") {
-         this.saveEditorDraft();
-      }
-
       this.mode = "freeform";
       this.modeContainer.clear();
 
@@ -1913,40 +1582,8 @@ class AskComponent extends Container {
       this.tui.requestRender();
    }
 
-   private showCommentMode(): void {
-      if (this.mode === "freeform") {
-         this.saveEditorDraft();
-      }
-
-      this.mode = "comment";
-      this.modeContainer.clear();
-
-      const editor = this.ensureEditor();
-      this.setEditorText(this.commentDraft);
-      (editor as any).focused = this._focused;
-
-      const selectedLabel = this.pendingSelections.length === 1 ? "Selected option:" : "Selected options:";
-      this.modeContainer.addChild(new Text(this.theme.fg("accent", this.theme.bold(selectedLabel)), 1, 0));
-      this.modeContainer.addChild(new Text(this.theme.fg("text", this.pendingSelections.join(", ")), 1, 0));
-      this.modeContainer.addChild(new Spacer(1));
-      this.modeContainer.addChild(editor);
-
-      this.updateHelpText();
-      this.invalidate();
-      this.tui.requestRender();
-   }
-
-   private toggleContext(): boolean {
-      if (this.mode !== "select" || !this.contextIsCollapsible) return false;
-      this.contextExpanded = !this.contextExpanded;
-      this.promptScrollOffset = 0;
-      this.invalidate();
-      this.tui.requestRender();
-      return true;
-   }
-
    private setPromptScrollOffset(nextOffset: number): boolean {
-      if (this.displayMode !== "overlay" && !this.contextExpanded) return false;
+      if (this.displayMode !== "overlay") return false;
       if (this.promptMaxScrollOffset <= 0) return false;
       const clamped = Math.max(0, Math.min(Math.floor(nextOffset), this.promptMaxScrollOffset));
       const changed = clamped !== this.promptScrollOffset;
@@ -1955,9 +1592,9 @@ class AskComponent extends Container {
    }
 
    private handlePromptScrollInput(data: string): boolean {
-      if (this.displayMode !== "overlay" && !this.contextExpanded) return false;
+      if (this.displayMode !== "overlay") return false;
       if (this.promptMaxScrollOffset <= 0) return false;
-      // Prompt scrolling is select-mode only: in freeform/comment modes the
+      // Prompt scrolling is select-mode only: in freeform mode the
       // editor owns PageUp/PageDown (tui.editor.pageUp/pageDown) for paging
       // through long input, so intercepting them here would steal editor keys.
       if (this.mode !== "select") return false;
@@ -1990,20 +1627,12 @@ class AskComponent extends Container {
    }
 
    handleInput(data: string): void {
-      if (matchesKey(data, this.getContextToggleKey() as any) && this.toggleContext()) {
-         return;
-      }
       if (this.handlePromptScrollInput(data)) {
          this.tui.requestRender();
          return;
       }
-      if (this.mode === "freeform" || this.mode === "comment") {
+      if (this.mode === "freeform") {
          if (matchesKey(data, Key.escape)) {
-            // Without options there is no list to go back to, so esc cancels.
-            if (this.options.length === 0) {
-               this.onDone(null);
-               return;
-            }
             this.showSelectMode();
             return;
          }
@@ -2018,7 +1647,7 @@ class AskComponent extends Container {
          return;
       }
 
-      if (this.allowMultiple) {
+      if (this.multiSelect) {
          this.ensureMultiSelectList().handleInput?.(data);
          this.tui.requestRender();
          return;
@@ -2035,7 +1664,7 @@ const INLINE_DOCK_RESERVED_ROWS = 5;
 // Answer rows the review page keeps before squeezing its footer.
 const REVIEW_MIN_CONTENT_ROWS = 3;
 
-/** Frame body lines in the ask_user box with the given title. */
+/** Frame body lines in the ask_user_question box with the given title. */
 function frameBox(theme: Theme, title: string, bodyLines: string[], width: number): string[] {
    const innerWidth = Math.max(1, width - BOX_BORDER_OVERHEAD);
    const borderColor = (s: string) => theme.fg("accent", s);
@@ -2048,13 +1677,14 @@ function frameBox(theme: Theme, title: string, bodyLines: string[], width: numbe
 
 /**
  * One prompt for a whole `questions` batch: a page per question plus a review
- * page. Each page is an AskComponent that stays alive, so filters, drafts, and
- * checkboxes survive moving between pages. Answers are recorded per page and
- * only the review page submits; esc that would cancel a page cancels the batch.
+ * page when asking multiple questions. Each page is an AskComponent that stays alive,
+ * so filters, drafts, and checkboxes survive moving between pages. Answers are
+ * recorded per page; for multiple questions only the review page submits, while a single
+ * question submits directly without a review page. Esc that would cancel a page cancels the batch.
  */
 class BatchAskComponent implements Component {
    private pages: AskComponent[];
-   private answers: Array<AskResponse | undefined>;
+   private answers: Array<AskUIResponse | undefined>;
    private current = 0;
    private title = "";
    private confirmingSkips = false;
@@ -2068,19 +1698,16 @@ class BatchAskComponent implements Component {
       private tui: TUI,
       private theme: Theme,
       private keybindings: KeybindingsManager,
-      private onDone: (answers: BatchAnswer[] | null) => void,
+      private onDone: (answers: AskAnswer[] | null) => void,
    ) {
       this.answers = questions.map(() => undefined);
       this.pages = questions.map((entry, index) => new AskComponent(
          entry.question,
-         entry.context,
+         entry.header,
          entry.options,
-         entry.allowMultiple,
-         entry.allowFreeform,
-         settings.allowComment,
+         entry.multiSelect,
          settings.displayMode,
          settings.singleSelectLayout,
-         settings.contextExpanded,
          tui,
          theme,
          keybindings,
@@ -2109,16 +1736,18 @@ class BatchAskComponent implements Component {
    }
 
    handleInput(data: string): void {
-      const pageCount = this.questions.length + 1;
-      // Tab and shift+tab move between pages here; inside a page, arrows and
-      // ctrl+j/k still move the option selection.
-      if (matchesKey(data, Key.tab)) {
-         this.goTo((this.current + 1) % pageCount);
-         return;
-      }
-      if (matchesKey(data, Key.shift("tab"))) {
-         this.goTo((this.current + pageCount - 1) % pageCount);
-         return;
+      if (this.questions.length > 1) {
+         const pageCount = this.questions.length + 1;
+         // Tab and shift+tab move between pages here; inside a page, arrows and
+         // ctrl+j/k still move the option selection.
+         if (matchesKey(data, Key.tab)) {
+            this.goTo((this.current + 1) % pageCount);
+            return;
+         }
+         if (matchesKey(data, Key.shift("tab"))) {
+            this.goTo((this.current + pageCount - 1) % pageCount);
+            return;
+         }
       }
       const page = this.pages[this.current];
       if (page) {
@@ -2128,12 +1757,29 @@ class BatchAskComponent implements Component {
       this.handleReviewInput(data);
    }
 
+   private toAnswer(index: number, response: AskUIResponse): AskAnswer {
+      return { question: this.questions[index]!.question, ...response };
+   }
+
+   /** Answered questions only, in question order; skips are omitted. */
+   private answeredList(): AskAnswer[] {
+      const result: AskAnswer[] = [];
+      this.answers.forEach((response, index) => {
+         if (response) result.push(this.toAnswer(index, response));
+      });
+      return result;
+   }
+
    private handlePageDone(index: number, result: AskUIResult | null): void {
       if (result === null) {
          this.onDone(null);
          return;
       }
       this.answers[index] = result;
+      if (this.questions.length === 1) {
+         this.onDone([this.toAnswer(index, result)]);
+         return;
+      }
       const count = this.questions.length;
       for (let step = 1; step <= count; step++) {
          const next = (index + step) % count;
@@ -2158,12 +1804,16 @@ class BatchAskComponent implements Component {
    }
 
    private updateChrome(): void {
+      if (this.questions.length <= 1) {
+         this.title = "ask_user_question";
+         return;
+      }
       const labels = this.questions.map((_, index) => {
          const label = `${index + 1}${this.answers[index] ? "✓" : ""}`;
          return index === this.current ? `[${label}]` : label;
       });
       const review = this.current === this.questions.length ? "[review]" : "review";
-      this.title = `ask_user ${labels.join(" ")} · ${review}`;
+      this.title = `ask_user_question ${labels.join(" ")} · ${review}`;
       const hint = literalHint(this.theme, "tab/shift+tab", "questions");
       for (const page of this.pages) page.setBatchChrome(this.title, hint);
    }
@@ -2183,8 +1833,7 @@ class BatchAskComponent implements Component {
             this.tui.requestRender();
             return;
          }
-         this.onDone(this.answers.map((response): BatchAnswer =>
-            response ? { status: "answered", response } : { status: "skipped" }));
+         this.onDone(this.answeredList());
          return;
       }
       // Kitty's keyboard protocol can deliver digits as CSI-u sequences.
@@ -2285,9 +1934,9 @@ class BatchAskComponent implements Component {
 type DialogOptions = { signal?: AbortSignal; timeout?: number };
 
 /**
- * Options for the next dialog stage. A batch shares one deadline across every
- * stage, so each stage gets only the time that is left (null once it has
- * passed); a single question keeps its fixed per-dialog timeout.
+ * Options for the next dialog stage. Every call shares one deadline across all
+ * questions and stages, so each stage gets only the time that is left (null
+ * once it has passed), including calls with just one question.
  */
 function dialogStageOptions(
    dialogOpts: DialogOptions | undefined,
@@ -2305,18 +1954,15 @@ function dialogStageOptions(
 async function askViaDialogs(
    ui: { select: Function; input: Function },
    question: string,
-   context: string | undefined,
    options: QuestionOption[],
-   allowMultiple: boolean,
-   allowFreeform: boolean,
-   allowComment: boolean,
+   multiSelect: boolean,
    dialogOpts?: DialogOptions,
    deadline?: number,
 ): Promise<AskUIResult | null> {
    if (dialogOpts?.signal?.aborted) return null;
-   const prompt = context ? `${question}\n\nContext:\n${context}` : question;
+   const prompt = question;
 
-   if (allowMultiple) {
+   if (multiSelect) {
       const optionList = formatOptionsForMessage(options);
       const selectionOpts = dialogStageOptions(dialogOpts, deadline);
       if (selectionOpts === null) return null;
@@ -2330,23 +1976,11 @@ async function askViaDialogs(
       const selections = parseDialogSelections(rawSelections);
       if (selections.length === 0) return null;
 
-      if (!allowComment) {
-         return createSelectionResponse(selections);
-      }
-
-      const commentOpts = dialogStageOptions(dialogOpts, deadline);
-      if (commentOpts === null) return null;
-      const comment = await ui.input(
-         buildCommentPrompt(prompt, selections),
-         "Optional comment (press Enter to skip)...",
-         commentOpts,
-      ) as string | undefined;
-      if (dialogOpts?.signal?.aborted || isCancelledInput(comment)) return null;
-      return createSelectionResponse(selections, comment);
+      return createMultiResponse(selections);
    }
 
-   const selectOptions = options.map((o) => o.title);
-   if (allowFreeform) selectOptions.push(FREEFORM_SENTINEL);
+   const selectOptions = options.map((o) => o.label);
+   selectOptions.push(FREEFORM_SENTINEL);
 
    const selectOpts = dialogStageOptions(dialogOpts, deadline);
    if (selectOpts === null) return null;
@@ -2358,22 +1992,10 @@ async function askViaDialogs(
       if (answerOpts === null) return null;
       const answer = await ui.input(prompt, "Type your answer...", answerOpts) as string | undefined;
       if (dialogOpts?.signal?.aborted || isCancelledInput(answer)) return null;
-      return createFreeformResponse(answer);
+      return createCustomResponse(answer);
    }
 
-   if (!allowComment) {
-      return createSelectionResponse([selected]);
-   }
-
-   const commentOpts = dialogStageOptions(dialogOpts, deadline);
-   if (commentOpts === null) return null;
-   const comment = await ui.input(
-      buildCommentPrompt(prompt, [selected]),
-      "Optional comment (press Enter to skip)...",
-      commentOpts,
-   ) as string | undefined;
-   if (dialogOpts?.signal?.aborted || isCancelledInput(comment)) return null;
-   return createSelectionResponse([selected], comment);
+   return createOptionResponse(selected);
 }
 
 /**
@@ -2385,38 +2007,24 @@ async function askViaDialogs(
 async function askBatchViaDialogs(
    ui: { select: Function; input: Function },
    questions: BatchQuestion[],
-   allowComment: boolean,
    signal: AbortSignal | undefined,
    deadline: number | undefined,
-): Promise<BatchAnswer[] | null> {
+): Promise<AskAnswer[] | null> {
    const dialogOpts = signal ? { signal } : undefined;
-   const answers: BatchAnswer[] = [];
+   const answers: AskAnswer[] = [];
    for (const [index, entry] of questions.entries()) {
       if (signal?.aborted) return null;
       const title = `(${index + 1}/${questions.length}) ${entry.question}`;
-      let response: AskResponse | null;
-      if (entry.options.length === 0) {
-         // Same as a single question without options: a plain text answer.
-         const prompt = entry.context ? `${title}\n\nContext:\n${entry.context}` : title;
-         const answerOpts = dialogStageOptions(dialogOpts, deadline);
-         if (answerOpts === null) return null;
-         const answer = await ui.input(prompt, "Type your answer...", answerOpts) as string | undefined;
-         response = signal?.aborted ? null : createFreeformResponse(answer);
-      } else {
-         response = await askViaDialogs(
-            ui,
-            title,
-            entry.context,
-            entry.options,
-            entry.allowMultiple,
-            entry.allowFreeform,
-            allowComment,
-            dialogOpts,
-            deadline,
-         );
-      }
+      const response = await askViaDialogs(
+         ui,
+         title,
+         entry.options,
+         entry.multiSelect,
+         dialogOpts,
+         deadline,
+      );
       if (!response) return null;
-      answers.push({ status: "answered", response });
+      answers.push({ question: entry.question, ...response });
    }
    return answers;
 }
@@ -2424,36 +2032,25 @@ async function askBatchViaDialogs(
 interface PromptSettings {
    displayMode: AskDisplayMode;
    singleSelectLayout: AskSingleSelectLayout;
-   allowComment: boolean;
-   contextExpanded: boolean;
+   timeout: number;
    shortcuts: ResolvedAskShortcuts;
 }
 
-/** Resolve presentation preferences: call parameter, then env var, then built-in default. */
-function resolvePromptSettings(params: AskParams): PromptSettings {
+/** Saved configuration, then existing environment variables, then built-in defaults. */
+function resolvePromptSettings(config: AskUserConfig): PromptSettings {
    const envMode = process.env.PI_ASK_USER_DISPLAY_MODE?.trim().toLowerCase();
    const envDisplayMode: AskDisplayMode | undefined =
       envMode === "overlay" || envMode === "inline" ? envMode : undefined;
    const envSingleSelectLayout = process.env.PI_ASK_USER_SINGLE_SELECT_LAYOUT?.trim().toLowerCase();
    return {
-      displayMode: params.displayMode ?? envDisplayMode ?? "overlay",
-      singleSelectLayout: params.singleSelectLayout ?? (envSingleSelectLayout === "list" ? "list" : "auto"),
-      allowComment: params.allowComment
-         ?? parseBooleanPreference(process.env.PI_ASK_USER_ALLOW_COMMENT)
-         ?? false,
-      contextExpanded: params.contextExpanded
-         ?? parseBooleanPreference(process.env.PI_ASK_USER_CONTEXT_EXPANDED)
-         ?? false,
+      displayMode: config.displayMode ?? envDisplayMode ?? ASK_USER_DEFAULTS.displayMode,
+      singleSelectLayout: config.singleSelectLayout ?? (envSingleSelectLayout === "list" ? "list" : ASK_USER_DEFAULTS.singleSelectLayout),
+      timeout: config.timeout ?? ASK_USER_DEFAULTS.timeout,
       shortcuts: {
          overlayToggle: resolveShortcut(
-            params.overlayToggleKey,
+            config.overlayToggleKey,
             process.env.PI_ASK_USER_OVERLAY_TOGGLE_KEY,
             DEFAULT_OVERLAY_TOGGLE_KEY,
-         ),
-         commentToggle: resolveShortcut(
-            params.commentToggleKey,
-            process.env.PI_ASK_USER_COMMENT_TOGGLE_KEY,
-            DEFAULT_COMMENT_TOGGLE_KEY,
          ),
       },
    };
@@ -2540,7 +2137,7 @@ async function runCustomPrompt<T>(ui: ExtensionUIContext, request: CustomPromptR
             overlayHandle.setHidden(nextHidden);
             if (nextHidden && !hasAnnouncedHide) {
                hasAnnouncedHide = true;
-               ui.notify?.(`ask_user hidden — press ${overlayToggle.spec} to reopen`, "info");
+               ui.notify?.(`ask_user_question hidden — press ${overlayToggle.spec} to reopen`, "info");
             }
             return { consume: true };
          });
@@ -2573,15 +2170,14 @@ async function runCustomPrompt<T>(ui: ExtensionUIContext, request: CustomPromptR
  */
 function normalizeBatchQuestions(params: AskParams): BatchQuestion[] {
    const { questions } = params;
-   if (typeof params.question === "string" && params.question.trim()) {
-      throw new Error(
-         "Use exactly one of question or questions. Put every question in questions, or ask a single question with question.",
-      );
+   const configured = ASK_USER_SETTING_KEYS.filter((field) => Object.prototype.hasOwnProperty.call(params, field));
+   if (configured.length > 0) {
+      throw new Error(`${configured.join(", ")} are configuration settings, not ask_user_question parameters. Use /ask-user-question-settings to configure them.`);
    }
-   const misplaced = BATCH_ENTRY_FIELDS.filter((field) => params[field] != null);
+   const misplaced = BATCH_ENTRY_FIELDS.filter((field) => Object.prototype.hasOwnProperty.call(params, field));
    if (misplaced.length > 0) {
       throw new Error(
-         `${misplaced.join(", ")} cannot be set at the top level together with questions. Set them on each questions entry instead.`,
+         `${misplaced.join(", ")} cannot be set at the top level. Set them on each questions entry instead, even when asking only one question.`,
       );
    }
    if (!Array.isArray(questions)) {
@@ -2589,12 +2185,12 @@ function normalizeBatchQuestions(params: AskParams): BatchQuestion[] {
    }
    if (questions.length < BATCH_MIN_QUESTIONS) {
       throw new Error(
-         `questions needs ${BATCH_MIN_QUESTIONS}-${BATCH_MAX_QUESTIONS} entries but got ${questions.length}. To ask one question, use question instead.`,
+         `questions needs ${BATCH_MIN_QUESTIONS}-${BATCH_MAX_QUESTIONS} entries but got ${questions.length}. To ask one question, use a questions array with one entry.`,
       );
    }
    if (questions.length > BATCH_MAX_QUESTIONS) {
       throw new Error(
-         `questions accepts at most ${BATCH_MAX_QUESTIONS} entries but got ${questions.length}. Ask the rest in a later ask_user call.`,
+         `questions accepts at most ${BATCH_MAX_QUESTIONS} entries but got ${questions.length}. Ask the rest in a later ask_user_question call.`,
       );
    }
 
@@ -2603,126 +2199,90 @@ function normalizeBatchQuestions(params: AskParams): BatchQuestion[] {
       const label = `questions[${index}]`;
       const question = typeof entry?.question === "string" ? entry.question.trim() : "";
       if (!question) throw new Error(`${label}.question must be a non-empty string.`);
-      const key = question.toLowerCase();
-      if (seen.has(key)) {
+      if (seen.has(question)) {
          throw new Error(`${label} repeats the question "${question}". Each question in a batch must be distinct.`);
       }
-      seen.add(key);
+      seen.add(question);
 
-      const rawOptions = entry.options ?? [];
-      if (!Array.isArray(rawOptions)) throw new Error(`${label}.options must be an array.`);
-      const options = rawOptions.map(coerceOption).filter((option): option is QuestionOption => option !== null);
-      if (rawOptions.length > 0 && options.length === 0) {
+      const header = typeof entry.header === "string" ? entry.header.trim() : "";
+      if (!header) throw new Error(`${label}.header must be a non-empty string.`);
+
+      const rawOptions = entry.options;
+      if (!Array.isArray(rawOptions)) {
+         throw new Error(`${label}.options must be an array of ${BATCH_MIN_OPTIONS}-${BATCH_MAX_OPTIONS} options.`);
+      }
+      if (rawOptions.length < BATCH_MIN_OPTIONS || rawOptions.length > BATCH_MAX_OPTIONS) {
          throw new Error(
-            `All ${rawOptions.length} option(s) in ${label} were malformed, so nothing could be shown to the user. `
-            + `Each option must be a plain string or an object like { "title": "Short label", "description": "Optional detail" }. `
-            + `Call ask_user again with corrected options.`,
+            `${label}.options needs ${BATCH_MIN_OPTIONS}-${BATCH_MAX_OPTIONS} entries but got ${rawOptions.length}.`,
          );
+      }
+      const options = rawOptions.map((option) => coerceOption(option));
+      const malformed = options.findIndex((option) => option === null);
+      if (malformed !== -1) {
+         throw new Error(
+            `${label}.options[${malformed}] must be an object like `
+            + `{ "label": "Short label", "description": "Why a user would pick it" }. `
+            + `Call ask_user_question again with corrected options.`,
+         );
+      }
+      const validOptions = options as QuestionOption[];
+
+      const seenLabels = new Set<string>();
+      for (const [optionIndex, option] of validOptions.entries()) {
+         if (seenLabels.has(option.label)) {
+            throw new Error(`${label}.options[${optionIndex}] repeats the label "${option.label}". Labels must be distinct within a question.`);
+         }
+         seenLabels.add(option.label);
+         if ((RESERVED_OPTION_LABELS as readonly string[]).includes(option.label)) {
+            throw new Error(`${label}.options[${optionIndex}] uses the reserved label "${option.label}". The prompt shows that row itself; pick a different label.`);
+         }
       }
 
       return {
          question,
-         context: typeof entry.context === "string" ? entry.context.trim() || undefined : undefined,
-         options,
-         allowMultiple: entry.allowMultiple ?? false,
-         allowFreeform: entry.allowFreeform ?? true,
+         header,
+         options: validOptions,
+         multiSelect: entry.multiSelect ?? false,
       };
    });
 }
 
-interface AskEventSubject {
-   question: string;
-   context?: string;
-   options: QuestionOption[];
+function formatAnswersForContent(details: AskResultDetails): string {
+   if (details.cancelled) return "User cancelled the questions";
+   const lines = details.answers.map((answer, index) =>
+      `${index + 1}. ${answer.question} → ${formatResponseSummary(answer)}`);
+   return [`User answered ${details.answers.length} questions:`, ...lines].join("\n");
 }
 
-/** Position of a question inside a `questions` batch, attached to its ask:* events. */
-interface BatchPosition {
-   index: number;
-   total: number;
-}
-
-function createAskEventEmitter(pi: ExtensionAPI) {
-   // Every installed extension receives these events. By default only the
-   // question and the response kind are broadcast; the context and the
-   // user's actual selections/comment/freeform text stay inside the tool
-   // result unless the user opts in (#51).
-   const emitFullEvents = parseBooleanPreference(process.env.PI_ASK_USER_EMIT_FULL_EVENTS) ?? false;
-   return {
-      answered(subject: AskEventSubject, response: AskResponse, batch?: BatchPosition): void {
-         const position = batch ? { batch } : {};
-         pi.events.emit(
-            "ask:answered",
-            emitFullEvents
-               ? { question: subject.question, context: subject.context, response, ...position }
-               : { question: subject.question, response: { kind: response.kind }, ...position },
-         );
-      },
-      cancelled(subject: AskEventSubject, batch?: BatchPosition): void {
-         const position = batch ? { batch } : {};
-         pi.events.emit(
-            "ask:cancelled",
-            emitFullEvents
-               ? { question: subject.question, context: subject.context, options: subject.options, ...position }
-               : { question: subject.question, ...position },
-         );
-      },
-   };
-}
-
-function formatBatchAnswers(details: AskBatchDetails): string {
-   const lines = details.questions.map((subject, index) => {
-      const answer = details.answers[index]!;
-      const summary = answer.status === "answered" ? formatResponseSummary(answer.response) : "(skipped)";
-      return `${index + 1}. ${subject.question} → ${summary}`;
-   });
-   const answered = details.answers.filter((answer) => answer.status === "answered").length;
-   return [`User answered ${answered} of ${details.questions.length} questions:`, ...lines].join("\n");
-}
-
-function formatBatchForMessage(questions: BatchQuestion[], allowComment: boolean): string {
+function formatBatchForMessage(questions: BatchQuestion[]): string {
    const blocks = questions.map((entry, index) => {
       const lines = [`${index + 1}. ${entry.question}`];
-      if (entry.context) lines.push(`   Context: ${entry.context.replace(/\n/g, "\n   ")}`);
-      if (entry.options.length > 0) {
-         lines.push(`   Options${entry.allowMultiple ? " (choose one or more)" : ""}:`);
-         lines.push(...formatOptionsForMessage(entry.options).split("\n").map((line) => `   ${line}`));
-         if (entry.allowFreeform) lines.push("   You can also answer freely.");
-      }
+      lines.push(`   Options${entry.multiSelect ? " (choose one or more)" : ""}:`);
+      lines.push(...formatOptionsForMessage(entry.options).split("\n").map((line) => `   ${line}`));
+      lines.push("   You can also answer freely.");
       return lines.join("\n");
    });
-   const commentHint = allowComment ? "\n\nAfter choosing an option, you may add an optional comment." : "";
-   return `Ask requires interactive mode. Please answer these questions:\n\n${blocks.join("\n\n")}${commentHint}`;
+   return `ask_user_question requires interactive mode. Please answer these questions:\n\n${blocks.join("\n\n")}`;
 }
 
 async function executeBatch(
    pi: ExtensionAPI,
-   params: AskParams,
+   questions: BatchQuestion[],
+   settings: PromptSettings,
    signal: AbortSignal | undefined,
-   onUpdate: AgentToolUpdateCallback<AskBatchDetails> | undefined,
+   onUpdate: AgentToolUpdateCallback<AskResultDetails> | undefined,
    ctx: ExtensionContext,
-): Promise<AgentToolResult<AskBatchDetails>> {
-   const questions = normalizeBatchQuestions(params);
-   const settings = resolvePromptSettings(params);
-   const events = createAskEventEmitter(pi);
-   const subjects = questions.map(({ question, context, options }) => ({ question, context, options }));
-   const details = (answers: BatchAnswer[], cancelled: boolean): AskBatchDetails => ({
-      kind: "batch",
-      questions: subjects,
-      answers,
-      cancelled,
-   });
-
+): Promise<AgentToolResult<AskResultDetails>> {
    if (!ctx.hasUI || !ctx.ui) {
-      throw new Error(formatBatchForMessage(questions, settings.allowComment));
+      throw new Error(formatBatchForMessage(questions));
    }
 
    onUpdate?.({
       content: [{ type: "text", text: "Waiting for user input..." }],
-      details: details([], false),
+      details: { answers: [], cancelled: false },
    });
 
-   const deadline = params.timeout && params.timeout > 0 ? Date.now() + params.timeout : undefined;
+   const deadline = settings.timeout > 0 ? Date.now() + settings.timeout : undefined;
    // One timer owns the batch deadline. It aborts the signal that every prompt
    // and dialog already listens to, so an open dialog closes exactly on time
    // (native dialog countdowns round up to whole seconds) and a late answer
@@ -2732,16 +2292,16 @@ async function executeBatch(
    signal?.addEventListener("abort", forwardAbort, { once: true });
    // An abort that already fired (for example inside onUpdate above) is not replayed.
    if (signal?.aborted) batch.abort();
-   const deadlineTimer = deadline === undefined ? undefined : setTimeout(() => batch.abort(), params.timeout);
-   let answers: BatchAnswer[] | null;
+   const deadlineTimer = deadline === undefined ? undefined : setTimeout(() => batch.abort(), settings.timeout);
+   let answers: AskAnswer[] | null;
    try {
-      answers = await whileBlocked(pi, () => runCustomPrompt<BatchAnswer[]>(ctx.ui, {
+      answers = await whileBlocked(pi, () => runCustomPrompt<AskAnswer[]>(ctx.ui, {
          signal: batch.signal,
          displayMode: settings.displayMode,
          overlayToggle: settings.shortcuts.overlayToggle,
          createComponent: (tui, theme, keybindings, complete) =>
             new BatchAskComponent(questions, settings, tui, theme, keybindings, complete),
-         fallback: () => askBatchViaDialogs(ctx.ui, questions, settings.allowComment, batch.signal, deadline),
+         fallback: () => askBatchViaDialogs(ctx.ui, questions, batch.signal, deadline),
       }));
    } finally {
       if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
@@ -2749,84 +2309,101 @@ async function executeBatch(
    }
 
    if (batch.signal.aborted || answers === null) {
-      subjects.forEach((subject, index) => events.cancelled(subject, { index, total: subjects.length }));
       return {
          content: [{ type: "text", text: "User cancelled the questions" }],
-         details: details([], true),
+         details: { answers: [], cancelled: true },
       };
    }
 
-   // Skipped questions emit nothing; each answered one emits its usual event.
-   answers.forEach((answer, index) => {
-      if (answer.status === "answered") {
-         events.answered(subjects[index]!, answer.response, { index, total: subjects.length });
-      }
-   });
-   const result = details(answers, false);
+   const details: AskResultDetails = { answers, cancelled: false };
    return {
-      content: [{ type: "text", text: formatBatchAnswers(result) }],
-      details: result,
+      content: [{ type: "text", text: formatAnswersForContent(details) }],
+      details,
    };
 }
 
-/** Expanded-result block: every option with the selected ones marked, then the comment. */
-function formatOptionMarkers(
-   theme: Theme,
-   options: QuestionOption[],
-   response: Extract<AskResponse, { kind: "selection" }>,
-   indent = "",
-): string {
-   const selectedTitles = new Set(response.selections);
-   let text = `\n${indent}` + theme.fg("dim", "Options:");
-   for (const opt of options) {
-      const desc = opt.description ? ` — ${opt.description}` : "";
-      const marker = selectedTitles.has(opt.title) ? theme.fg("success", "●") : theme.fg("dim", "○");
-      text += `\n${indent}  ${marker} ${theme.fg("dim", opt.title)}${theme.fg("dim", desc)}`;
-   }
-   if (response.comment) {
-      text += `\n${indent}${theme.fg("dim", "Comment:")} ${theme.fg("dim", response.comment)}`;
-   }
-   return text;
-}
-
-function formatBatchResult(theme: Theme, details: AskBatchDetails, expanded: boolean): string {
+function formatResult(theme: Theme, details: AskResultDetails): string {
    if (details.cancelled) return theme.fg("warning", "Cancelled");
-   const answered = details.answers.filter((answer) => answer.status === "answered").length;
    let text = theme.fg("success", "✓ ")
-      + theme.fg("accent", `${answered} of ${details.questions.length} answered`);
-   details.questions.forEach((subject, index) => {
-      const answer = details.answers[index]!;
-      text += `\n${theme.fg("dim", `${index + 1}.`)} ${theme.fg("muted", subject.question)}${theme.fg("dim", " → ")}`;
-      if (answer.status === "skipped") {
-         text += theme.fg("warning", "(skipped)");
-         return;
-      }
-      const response = answer.response;
-      if (response.kind === "freeform") {
+      + theme.fg("accent", `${details.answers.length} answered`);
+   details.answers.forEach((answer, index) => {
+      text += `\n${theme.fg("dim", `${index + 1}.`)} ${theme.fg("muted", answer.question)}${theme.fg("dim", " → ")}`;
+      if (answer.kind === "custom") {
          text += theme.fg("muted", "(wrote) ");
       }
-      text += theme.fg("accent", formatResponseSummary(response));
-      if (!expanded) return;
-      if (subject.context) {
-         text += `\n   ${theme.fg("dim", subject.context)}`;
-      }
-      if (isSelectionResponse(response) && subject.options.length > 0) {
-         text += formatOptionMarkers(theme, subject.options, response, "   ");
-      }
+      text += theme.fg("accent", formatResponseSummary(answer));
    });
    return text;
 }
 
 export default function(pi: ExtensionAPI) {
+   const settingsStore = new AskUserSettingsStore(join(getAgentDir(), ASK_USER_SETTINGS_FILENAME));
+   pi.registerCommand("ask-user-question-settings", {
+      description: "Configure ask_user_question display, layout, shortcuts and timeout (saved globally)",
+      handler: async (args, ctx) => {
+         const reportError = (error: unknown) => ctx.ui.notify(`Cannot update ask_user_question settings (${settingsStore.path}): ${String(error)}`, "error");
+         const save = (key: AskUserSettingKey, text: string) => {
+            settingsStore.update(key, parseSettingValue(key, text));
+            ctx.ui.notify(`ask_user_question ${key}: ${text.trim()} — saved to ${settingsStore.path}`, "info");
+         };
+         try {
+            if (args.trim()) {
+               const [key, ...words] = args.trim().split(/\s+/);
+               if (!ASK_USER_SETTING_KEYS.includes(key as AskUserSettingKey) || words.length !== 1) {
+                  ctx.ui.notify(`Usage: /ask-user-question-settings <${ASK_USER_SETTING_KEYS.join("|")}> <value|default>`, "warning");
+                  return;
+               }
+               save(key as AskUserSettingKey, words[0]!);
+               return;
+            }
+            if (!ctx.hasUI) {
+               ctx.ui.notify("Use /ask-user-question-settings <setting> <value|default> when interactive dialogs are unavailable.", "warning");
+               return;
+            }
+            while (true) {
+               const config = settingsStore.read();
+               const effective = resolvePromptSettings(config);
+               const values = {
+                  displayMode: effective.displayMode,
+                  singleSelectLayout: effective.singleSelectLayout,
+                  overlayToggleKey: effective.shortcuts.overlayToggle.spec ?? "off",
+                  timeout: effective.timeout,
+               };
+               const choices = ASK_USER_SETTING_KEYS.map((key) => `${key}: ${values[key]}${Object.hasOwn(config, key) ? " (saved)" : " (environment/default)"}`);
+               const selected = await ctx.ui.select("ask_user_question settings — saved globally", [...choices, "Done"]);
+               const index = selected === undefined ? -1 : choices.indexOf(selected);
+               if (index < 0) return;
+               const key = ASK_USER_SETTING_KEYS[index]!;
+               const options = key === "displayMode" ? ["inline", "overlay", "default"]
+                  : key === "singleSelectLayout" ? ["auto", "list", "default"] : undefined;
+               const value = options
+                  ? await ctx.ui.select(`Configure ${key} (default restores environment/built-in fallback)`, options)
+                  : await ctx.ui.input(
+                     `Configure ${key}${key === "timeout" ? " in milliseconds (0 = no timeout)" : " (off = disabled)"}`,
+                     `Current: ${values[key]}. Enter a value or default to restore fallback.`,
+                  );
+               if (value === undefined || value === null) continue;
+               try {
+                  save(key, value);
+               } catch (error) {
+                  reportError(error);
+               }
+            }
+         } catch (error) {
+            reportError(error);
+         }
+      },
+   });
+
    // Flat object shape: union item schemas get stripped or rejected
    // by several providers/proxies (Google function calling,
    // Codex-style backends, cmux), leaving the model to guess the shape
-   // and produce empty options. Plain strings are still accepted at
-   // runtime for older transcripts. See issue #22.
+   // and produce empty options. See issue #22.
    const optionSchema = Type.Object({
-      title: Type.String({ description: "Short title for this option" }),
-      description: Type.Optional(
-         Type.String({ description: "Longer description explaining this option" }),
+      label: Type.String({ description: "Short label for this option. This is the value returned when the user picks it." }),
+      description: Type.String({ description: "One line explaining what choosing this option means" }),
+      preview: Type.Optional(
+         Type.String({ description: "Optional longer preview shown beside this option on wide terminals" }),
       ),
    });
 
@@ -2835,286 +2412,95 @@ export default function(pi: ExtensionAPI) {
    const modelOnly: Record<string, unknown> = { exposure: "model-only" };
    pi.registerTool({
       ...modelOnly,
-      name: "ask_user",
-      label: "Ask User",
+      name: "ask_user_question",
+      label: "Ask User Question",
       description:
-         "Ask the user a question with optional multiple-choice answers. Use this to gather information interactively. Ask one focused question per call, or 2-4 independent questions together through questions. Before calling, gather context with tools (read/web/ref) and pass a short summary via the context field.",
+         "Ask the user 1-4 focused multiple-choice questions. Each question needs a header, a question, and 2-4 options with a label and a description. The user can always pick a free-form answer instead of the listed options. Multiple questions must be independent with settled prerequisites.",
       promptSnippet:
-         "Ask the user one focused question (or 2-4 independent ones together) with optional multiple-choice answers to gather information interactively",
+         "Ask the user 1-4 focused questions, each with 2-4 labelled options",
       promptGuidelines: [
-         "Before calling ask_user, gather context with tools (read/web/ref) and pass a short summary via the context field.",
-         "Use ask_user when the user's intent is ambiguous, when a decision requires explicit user input, or when multiple valid options exist.",
-         "Ask one focused question per ask_user call by default.",
-         "Use questions (2-4 entries) only for independent decisions whose prerequisites are already settled; ask anything that depends on another answer in a later ask_user call.",
+         "Use ask_user_question when the user's intent is ambiguous, when a decision requires explicit user input, or when multiple valid options exist.",
+         "Always use the questions array, with one focused question by default. Never pass question, header, options, or multiSelect at the top level.",
+         "Every question needs a short header, the question text, and 2-4 options. Give each option a distinct label plus a description of its trade-off. The prompt adds its own free-form row, so never label an option \"Other\", \"Type something.\", or \"Next\".",
+         "Set multiSelect only when the user may legitimately pick several options at once.",
+         "When questions contains 2-4 entries, use it only for independent decisions whose prerequisites are already settled; ask anything that depends on another answer in a later ask_user_question call.",
          "Do not combine multiple numbered, multipart, or unrelated questions into one question's text.",
+         "Display, layout, shortcuts and timeout are user settings managed by /ask-user-question-settings, not tool parameters. Do not pass them to ask_user_question.",
       ],
       // Block other tool calls in the same assistant turn until the user answers,
-      // so the model can't batch ask_user with bash/edit/write and let those run
+      // so the model can't batch ask_user_question with bash/edit/write and let those run
       // (potentially with side effects) before the user sees the prompt.
       executionMode: "sequential",
       parameters: Type.Object({
-         question: Type.Optional(
-            Type.String({ description: "The question to ask the user. Omit when using questions." }),
-         ),
-         questions: Type.Optional(
-            Type.Array(
-               Type.Object({
-                  question: Type.String({ description: "One question in the batch" }),
-                  context: Type.Optional(
-                     Type.String({ description: "Relevant context to show with this question (summary of findings)" }),
-                  ),
-                  options: Type.Optional(
-                     Type.Array(optionSchema, { description: "List of options for this question" }),
-                  ),
-                  allowMultiple: Type.Optional(
-                     Type.Boolean({ description: "Allow selecting multiple options. Default: false" }),
-                  ),
-                  allowFreeform: Type.Optional(
-                     Type.Boolean({ description: "Add a freeform text option. Default: true" }),
-                  ),
-               }),
-               {
-                  minItems: BATCH_MIN_QUESTIONS,
-                  maxItems: BATCH_MAX_QUESTIONS,
-                  description: "2-4 independent questions shown together, used instead of question. Set context, options, allowMultiple, and allowFreeform on each entry; the remaining parameters apply to the whole batch.",
-               },
-            ),
-         ),
-         context: Type.Optional(
-            Type.String({
-               description: "Relevant context to show before the question (summary of findings)",
+         questions: Type.Array(
+            Type.Object({
+               question: Type.String({ description: "One focused question to ask the user" }),
+               header: Type.String({ description: "Short group label shown above the question" }),
+               options: Type.Array(
+                  optionSchema,
+                  {
+                     minItems: BATCH_MIN_OPTIONS,
+                     maxItems: BATCH_MAX_OPTIONS,
+                     description: "2-4 distinct options for this question. The prompt always adds its own free-form choice, so do not add one here.",
+                  },
+               ),
+               multiSelect: Type.Optional(
+                  Type.Boolean({ description: "Allow selecting multiple options. Default: false" }),
+               ),
             }),
+            {
+               minItems: BATCH_MIN_QUESTIONS,
+               maxItems: BATCH_MAX_QUESTIONS,
+               description: "Required array of 1-4 focused questions, even when asking only one. Set question, header, options, and multiSelect on each entry.",
+            },
          ),
-         options: Type.Optional(
-            Type.Array(optionSchema, { description: "List of options for the user to choose from" }),
-         ),
-         allowMultiple: Type.Optional(
-            Type.Boolean({ description: "Allow selecting multiple options. Default: false" }),
-         ),
-         allowFreeform: Type.Optional(
-            Type.Boolean({ description: "Add a freeform text option. Default: true" }),
-         ),
-         allowComment: Type.Optional(
-            Type.Boolean({ description: "Collect an optional comment after selecting one or more options. Default: PI_ASK_USER_ALLOW_COMMENT env var if set, otherwise false." }),
-         ),
-         displayMode: Type.Optional(
-            StringEnum(["overlay", "inline"] as const, {
-               description: "UI rendering mode. 'overlay' shows a centered modal, 'inline' renders in-place. Default: PI_ASK_USER_DISPLAY_MODE env var if set, otherwise 'overlay'. Omit to respect the user's configured preference.",
-            }),
-         ),
-         singleSelectLayout: Type.Optional(
-            StringEnum(["auto", "list"] as const, {
-               description: "Single-select layout. 'auto' uses a details pane on wide terminals; 'list' always keeps descriptions below options. Default: PI_ASK_USER_SINGLE_SELECT_LAYOUT if set, otherwise 'auto'.",
-            }),
-         ),
-         contextExpanded: Type.Optional(
-            Type.Boolean({
-               description: "Start with oversized context expanded instead of collapsed behind a one-line summary. Default: PI_ASK_USER_CONTEXT_EXPANDED env var if set, otherwise false.",
-            }),
-         ),
-         overlayToggleKey: Type.Optional(
-            Type.String({
-               description:
-                  "Shortcut for hiding/showing the overlay popup (overlay mode only), e.g. 'alt+o' or 'ctrl+shift+h'. Pass 'off' to disable. Default: PI_ASK_USER_OVERLAY_TOGGLE_KEY env var if set, otherwise 'alt+o'.",
-            }),
-         ),
-         commentToggleKey: Type.Optional(
-            Type.String({
-               description:
-                  "Shortcut for toggling the optional comment/extra-context row when allowComment is true, e.g. 'ctrl+g'. Pass 'off' to disable. Default: PI_ASK_USER_COMMENT_TOGGLE_KEY env var if set, otherwise 'ctrl+g'.",
-            }),
-         ),
-         timeout: Type.Optional(
-            Type.Number({ description: "Auto-dismiss after N milliseconds. Returns null (cancelled) when expired." }),
-         ),
-      }),
+      }, { additionalProperties: false }),
 
       async execute(_toolCallId, params, signal, onUpdate, ctx) {
-         if ((params as AskParams).questions != null) {
-            if (signal?.aborted) {
-               return {
-                  content: [{ type: "text", text: "Cancelled" }],
-                  details: { kind: "batch", questions: [], answers: [], cancelled: true } as AskBatchDetails,
-               };
-            }
-            return executeBatch(pi, params as AskParams, signal, onUpdate, ctx);
-         }
-
+         // Validate even an already-aborted call: removed fields are never accepted.
+         const questions = normalizeBatchQuestions(params as AskParams);
          if (signal?.aborted) {
             return {
                content: [{ type: "text", text: "Cancelled" }],
-               details: { question: params.question, options: [], response: null, cancelled: true } as AskToolDetails,
+               details: { answers: [], cancelled: true } as AskResultDetails,
             };
          }
-
-         if (typeof params.question !== "string") {
-            throw new Error(
-               "ask_user needs question (one focused question) or questions (2-4 independent questions).",
-            );
+         let config: AskUserConfig = {};
+         try {
+            config = settingsStore.read();
+         } catch (error) {
+            ctx.ui?.notify?.(`Cannot load ask_user_question settings from ${settingsStore.path}: ${String(error)}. Using environment/default settings.`, "warning");
          }
-
-         const question = params.question;
-         const {
-            context,
-            options: rawOptions = [],
-            allowMultiple = false,
-            allowFreeform = true,
-            timeout,
-         } = params as AskParams;
-         const settings = resolvePromptSettings(params as AskParams);
-         const { allowComment } = settings;
-         const options = rawOptions.map(coerceOption).filter((option): option is QuestionOption => option !== null);
-         const normalizedContext = context?.trim() || undefined;
-         const dialogOpts = signal
-            ? (timeout ? { signal, timeout } : { signal })
-            : (timeout ? { timeout } : undefined);
-         const events = createAskEventEmitter(pi);
-         const subject: AskEventSubject = { question, context: normalizedContext, options };
-
-         if (rawOptions.length > 0 && options.length === 0) {
-            throw new Error(
-               `All ${rawOptions.length} option(s) were malformed, so nothing could be shown to the user. `
-               + `Each option must be a plain string or an object like { "title": "Short label", "description": "Optional detail" }. `
-               + `Call ask_user again with corrected options.`,
-            );
-         }
-
-         if (!ctx.hasUI || !ctx.ui) {
-            const optionText = options.length > 0 ? `\n\nOptions:\n${formatOptionsForMessage(options)}` : "";
-            const freeformHint = allowFreeform ? "\n\nYou can also answer freely." : "";
-            const commentHint = allowComment ? "\n\nAfter choosing an option, you may add an optional comment." : "";
-            const contextText = normalizedContext ? `\n\nContext:\n${normalizedContext}` : "";
-            throw new Error(
-               `Ask requires interactive mode. Please answer:\n\n${question}${contextText}${optionText}${freeformHint}${commentHint}`,
-            );
-         }
-
-         if (options.length === 0) {
-            const prompt = normalizedContext ? `${question}\n\nContext:\n${normalizedContext}` : question;
-            const answer = await whileBlocked(pi, () => ctx.ui.input(prompt, "Type your answer...", dialogOpts));
-            const response = signal?.aborted ? null : createFreeformResponse(answer);
-
-            if (!response) {
-               events.cancelled(subject);
-               return {
-                  content: [{ type: "text", text: "User cancelled the question" }],
-                  details: { question, context: normalizedContext, options, response: null, cancelled: true } as AskToolDetails,
-               };
-            }
-
-            events.answered(subject, response);
-            return {
-               content: [{ type: "text", text: `User answered: ${formatResponseSummary(response)}` }],
-               details: { question, context: normalizedContext, options, response, cancelled: false } as AskToolDetails,
-            };
-         }
-
-         onUpdate?.({
-            content: [{ type: "text", text: "Waiting for user input..." }],
-            details: { question, context: normalizedContext, options, response: null, cancelled: false },
-         });
-
-         const result = await whileBlocked(pi, () => runCustomPrompt<AskUIResult>(ctx.ui, {
-            signal,
-            timeout,
-            displayMode: settings.displayMode,
-            overlayToggle: settings.shortcuts.overlayToggle,
-            createComponent: (tui, theme, keybindings, complete) => new AskComponent(
-               question,
-               normalizedContext,
-               options,
-               allowMultiple,
-               allowFreeform,
-               allowComment,
-               settings.displayMode,
-               settings.singleSelectLayout,
-               settings.contextExpanded,
-               tui,
-               theme,
-               keybindings,
-               settings.shortcuts,
-               complete,
-            ),
-            fallback: () => askViaDialogs(
-               ctx.ui,
-               question,
-               normalizedContext,
-               options,
-               allowMultiple,
-               allowFreeform,
-               allowComment,
-               dialogOpts,
-            ),
-         }));
-
-         if (signal?.aborted || result === null) {
-            events.cancelled(subject);
-            return {
-               content: [{ type: "text", text: "User cancelled the question" }],
-               details: { question, context: normalizedContext, options, response: null, cancelled: true } as AskToolDetails,
-            };
-         }
-
-         events.answered(subject, result);
-         return {
-            content: [{ type: "text", text: `User answered: ${formatResponseSummary(result)}` }],
-            details: {
-               question,
-               context: normalizedContext,
-               options,
-               response: result,
-               cancelled: false,
-            } as AskToolDetails,
-         };
+         return executeBatch(pi, questions, resolvePromptSettings(config), signal, onUpdate, ctx);
       },
 
       renderCall(args, theme) {
-         if (Array.isArray(args.questions)) {
-            const entries: unknown[] = args.questions;
-            let text = theme.fg("toolTitle", theme.bold("ask_user "));
-            text += theme.fg("muted", `${entries.length} questions`);
-            if (args.allowComment) {
-               text += theme.fg("dim", " [optional comment]");
-            }
-            entries.forEach((entry, index) => {
-               const record = (entry ?? {}) as { question?: unknown; options?: unknown; allowMultiple?: unknown };
-               const question = typeof record.question === "string" ? record.question : "";
-               const optionCount = Array.isArray(record.options) ? record.options.length : 0;
-               const notes = [
-                  optionCount > 0 ? `${optionCount} option(s)` : "",
-                  record.allowMultiple ? "multi-select" : "",
-               ].filter(Boolean).join(", ");
-               text += "\n" + theme.fg("dim", `  ${index + 1}. ${question}${notes ? ` (${notes})` : ""}`);
-            });
-            return new Text(text, 0, 0);
-         }
-
-         const question = (args.question as string) || "";
-         const rawOptions = Array.isArray(args.options) ? args.options : [];
-         let text = theme.fg("toolTitle", theme.bold("ask_user "));
-         text += theme.fg("muted", question);
-         if (rawOptions.length > 0) {
-            const labels = rawOptions.map((o: unknown) => coerceOption(o)?.title ?? "<invalid>");
-            text += "\n" + theme.fg("dim", `  ${rawOptions.length} option(s): ${labels.join(", ")}`);
-         }
-         if (args.allowMultiple) {
-            text += theme.fg("dim", " [multi-select]");
-         }
-         if (args.allowComment) {
-            text += theme.fg("dim", " [optional comment]");
-         }
+         const entries: unknown[] = Array.isArray(args.questions) ? args.questions : [];
+         let text = theme.fg("toolTitle", theme.bold("ask_user_question "));
+         text += theme.fg("muted", `${entries.length} questions`);
+         entries.forEach((entry, index) => {
+            const record = (entry ?? {}) as { question?: unknown; header?: unknown; options?: unknown; multiSelect?: unknown };
+            const question = typeof record.question === "string" ? record.question : "";
+            const optionCount = Array.isArray(record.options) ? record.options.length : 0;
+            const notes = [
+               optionCount > 0 ? `${optionCount} option(s)` : "",
+               record.multiSelect ? "multi-select" : "",
+            ].filter(Boolean).join(", ");
+            const header = typeof record.header === "string" && record.header ? ` [${record.header}]` : "";
+            text += "\n" + theme.fg("dim", `  ${index + 1}.${header} ${question}${notes ? ` (${notes})` : ""}`);
+         });
          return new Text(text, 0, 0);
       },
 
       renderResult(result, options, theme, context) {
-         const details = result.details as ((AskToolDetails | AskBatchDetails) & { error?: string }) | undefined;
+         const details = result.details as (AskResultDetails | undefined);
 
          if (details?.error || context?.isError) {
             const message = details?.error ?? (
                result.content
                   ?.map((part) => part.type === "text" ? part.text : "")
                   .join("\n")
-                  .trim() || "ask_user failed"
+                  .trim() || "ask_user_question failed"
             );
             return new Text(theme.fg("error", `✗ ${message}`), 0, 0);
          }
@@ -3127,33 +2513,11 @@ export default function(pi: ExtensionAPI) {
             return new Text(theme.fg("muted", waitingText), 0, 0);
          }
 
-         if (details && isBatchDetails(details)) {
-            return new Text(formatBatchResult(theme, details, options.expanded), 0, 0);
-         }
-
-         if (!details || details.cancelled || !details.response) {
+         if (!details) {
             return new Text(theme.fg("warning", "Cancelled"), 0, 0);
          }
 
-         const response = details.response;
-         let text = theme.fg("success", "✓ ");
-         if (response.kind === "freeform") {
-            text += theme.fg("muted", "(wrote) ");
-         }
-         text += theme.fg("accent", formatResponseSummary(response));
-
-         if (options.expanded) {
-            text += "\n" + theme.fg("dim", `Q: ${details.question}`);
-            if (details.context) {
-               text += "\n" + theme.fg("dim", details.context);
-            }
-
-            if (isSelectionResponse(response) && details.options.length > 0) {
-               text += formatOptionMarkers(theme, details.options, response);
-            }
-         }
-
-         return new Text(text, 0, 0);
+         return new Text(formatResult(theme, details), 0, 0);
       },
    });
 }

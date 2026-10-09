@@ -13,8 +13,8 @@ const { validateToolArguments } = await import(new URL("./dist/utils/validation.
 const loaded = await loadExtensions([resolve("index.ts")], process.cwd(), createEventBus());
 assert.deepEqual(loaded.errors, []);
 assert.equal(loaded.extensions.length, 1);
-const tool = loaded.extensions[0].tools.get("ask_user")?.definition;
-assert.ok(tool, "ask_user must be registered");
+const tool = loaded.extensions[0].tools.get("ask_user_question")?.definition;
+assert.ok(tool, "ask_user_question must be registered");
 
 let checked = 0;
 for (const file of [
@@ -30,9 +30,9 @@ for (const file of [
       assert.doesNotThrow(() => {
          const args = JSON.parse(fence[1]);
          validateToolArguments(tool, { id: "doc-example", name: tool.name, arguments: args });
-      }, `${file}:${line}: invalid ask_user example`);
+      }, `${file}:${line}: invalid ask_user_question example`);
       checked++;
       console.log(`${file}:${line} passed`);
    }
 }
-console.log(`Validated ${checked} JSON examples against the registered ask_user schema.`);
+console.log(`Validated ${checked} JSON examples against the registered ask_user_question schema.`);

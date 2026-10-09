@@ -1,7 +1,7 @@
 {
-  "name": "pi-ask-user",
+  "name": "pi-my-ask-user",
   "version": "0.16.0",
-  "description": "Interactive ask_user tool for pi-coding-agent with searchable split-pane selection UI, multi-select, and freeform input",
+  "description": "Interactive ask_user_question tool for pi-coding-agent with searchable split-pane selection UI, multi-select, and freeform input",
   "type": "module",
   "keywords": [
     "pi-package",
@@ -9,19 +9,19 @@
     "pi-coding-agent",
     "extension",
     "ask",
-    "ask_user",
+    "ask_user_question",
     "interactive"
   ],
   "author": "Enzo Lucchesi <enzo@edl.sh>",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/edlsh/pi-ask-user.git"
+    "url": "git+https://github.com/cybershape/pi-my-ask-user.git"
   },
   "bugs": {
-    "url": "https://github.com/edlsh/pi-ask-user/issues"
+    "url": "https://github.com/cybershape/pi-my-ask-user/issues"
   },
-  "homepage": "https://github.com/edlsh/pi-ask-user#readme",
+  "homepage": "https://github.com/cybershape/pi-my-ask-user#readme",
   "publishConfig": {
     "access": "public"
   },
@@ -35,6 +35,7 @@
   },
   "files": [
     "index.ts",
+    "ask-user-settings.ts",
     "single-select-layout.ts",
     "skills",
     "README.md",

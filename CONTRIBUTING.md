@@ -31,16 +31,16 @@ remain unchanged. Updating the current development host also requires updating
 the CI matrix and checking the minimum host.
 
 For UI changes, also check a real terminal: overlay and inline mode, narrow and
-wide terminals, resize, long context, comments/freeform, timeout and abort, and
-non-ASCII text. Automated smoke checks do not replace interactive verification.
+wide terminals, resize, long option lists and descriptions, the free-form
+editor, timeout and abort, and non-ASCII text. Automated smoke checks do not
+replace interactive verification.
 
 ## Pull requests
 
 Keep changes small and explain their behavior and tests. Include a regression
 test for a bug fix. For cancellation, verify that the dialog closes, owned
-listeners/timers are released, and no successful answer is emitted afterward.
-For event changes, preserve default payload redaction. Do not combine new API
-features with maintenance fixes.
+listeners/timers are released, and no successful answer is recorded afterward.
+Do not combine new API features with maintenance fixes.
 
 When reporting a bug, include Pi and package versions, terminal, display mode,
 relevant environment preferences, the tool arguments, and reproduction steps.

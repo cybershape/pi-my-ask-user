@@ -1,10 +1,13 @@
-import { beforeAll, describe, expect, mock, onTestFinished, spyOn, test } from "bun:test";
-import { getEventListeners } from "node:events";
+import { beforeAll, describe, expect, mock, onTestFinished, test } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { ASK_USER_SETTING_KEYS, ASK_USER_SETTINGS_FILENAME } from "./ask-user-settings";
 import type { StringEnumBuilder } from "./index";
 
 let editorInputs: string[] = [];
 let editorText = "";
 let emittedEvents: Array<{ name: string; payload: any }> = [];
+let mockAgentDir = "";
 
 function wrapPlainText(text: string, width = 80): string[] {
    const lines: string[] = [];
@@ -102,13 +105,6 @@ function createKeybindings(overrides: Partial<Record<string, string[]>> = {}) {
    };
 }
 
-type AskComponentFactory = (
-   tui: unknown,
-   theme: unknown,
-   keybindings: unknown,
-   done: (value: unknown) => void,
-) => { handleInput(data: string): void };
-
 beforeAll(() => {
    // Model the failure mode from https://github.com/edlsh/pi-ask-user/issues/17.
    // `getMarkdownTheme()` returns a bag of closures that read through a Proxy
@@ -134,6 +130,7 @@ beforeAll(() => {
    mock.module("@earendil-works/pi-coding-agent", () => ({
       DynamicBorder: class { },
       getMarkdownTheme: () => brokenMarkdownTheme,
+      getAgentDir: () => mockAgentDir,
       rawKeyHint: (key: string, description: string) => `${key} ${description}`,
    }));
 
@@ -190,16 +187,22 @@ beforeAll(() => {
       },
    }));
 
+   const optional = Symbol("optional schema");
    mock.module("@sinclair/typebox", () => ({
       Type: {
-         Object: (value: unknown) => value,
-         String: (value?: unknown) => value,
-         Optional: (value: unknown) => value,
-         Array: (value: unknown) => value,
-         Union: (value: unknown) => value,
-         Literal: (value: unknown) => value,
-         Boolean: (value?: unknown) => value,
-         Number: (value?: unknown) => value,
+         Object: (properties: Record<string, any>, settings = {}) => ({
+            type: "object",
+            properties,
+            required: Object.keys(properties).filter((key) => !properties[key][optional]),
+            ...settings,
+         }),
+         String: (settings = {}) => ({ type: "string", ...settings }),
+         Optional: (value: any) => ({ ...value, [optional]: true }),
+         Array: (items: unknown, settings = {}) => ({ type: "array", items, ...settings }),
+         Union: (anyOf: unknown) => ({ anyOf }),
+         Literal: (value: unknown) => ({ const: value }),
+         Boolean: (settings = {}) => ({ type: "boolean", ...settings }),
+         Number: (settings = {}) => ({ type: "number", ...settings }),
          Unsafe: (value: unknown) => value,
       },
    }));
@@ -207,43 +210,65 @@ beforeAll(() => {
 
 type RegisteredTool = {
    execute: (...args: any[]) => Promise<any>;
+   renderCall: (args: any, theme: any) => any;
    renderResult: (result: any, options: any, theme: any, context?: any) => any;
+   parameters: any;
+   executionMode: string;
+   settingsCommand: { handler: (args: string, ctx: any) => Promise<void> };
+   settingsPath: string;
+   configureSettings: (config: Record<string, unknown>) => void;
 };
 
-function stubEnv(key: string, value: string): void {
+function stubEnv(key: string, value: string | undefined): void {
    const original = process.env[key];
-   process.env[key] = value;
+   if (value === undefined) delete process.env[key];
+   else process.env[key] = value;
    onTestFinished(() => {
-      if (original === undefined) {
-         delete process.env[key];
-      } else {
-         process.env[key] = original;
-      }
+      if (original === undefined) delete process.env[key];
+      else process.env[key] = original;
    });
 }
 
-async function setupTool(): Promise<RegisteredTool> {
+async function setupTool(initialSettings: Record<string, unknown> = {}): Promise<RegisteredTool> {
    const { default: askUserExtension } = await import("./index");
+   const agentDir = mkdtempSync(join(process.cwd(), ".ask-user-test-"));
+   mockAgentDir = agentDir;
+   onTestFinished(() => rmSync(agentDir, { recursive: true, force: true }));
    let registeredTool: RegisteredTool | undefined;
+   let settingsCommand: RegisteredTool["settingsCommand"] | undefined;
    emittedEvents = [];
    const pi = {
-      registerTool(tool: RegisteredTool) {
-         registeredTool = tool;
+      registerCommand(name: string, command: RegisteredTool["settingsCommand"]) {
+         expect(name).toBe("ask-user-question-settings");
+         settingsCommand = command;
       },
+      registerTool(tool: RegisteredTool) { registeredTool = tool; },
       events: {
-         emit(name: string, payload: any) {
-            emittedEvents.push({ name, payload });
-         },
+         emit(name: string, payload: any) { emittedEvents.push({ name, payload }); },
       },
    } as any;
 
    askUserExtension(pi);
 
-   if (!registeredTool) {
-      throw new Error("Tool was not registered");
-   }
+   if (!registeredTool) throw new Error("Tool was not registered");
+   if (!settingsCommand) throw new Error("Settings command was not registered");
 
-   return registeredTool;
+   const tool = Object.assign(registeredTool, {
+      settingsCommand,
+      settingsPath: join(agentDir, ASK_USER_SETTINGS_FILENAME),
+      configureSettings(config: Record<string, unknown>) {
+         for (const [key, value] of Object.entries(config)) {
+            let error: string | undefined;
+            void settingsCommand!.handler(`${key} ${value === undefined ? "default" : value === null ? "off" : value}`, {
+               hasUI: true,
+               ui: { notify(message: string, type: string) { if (type === "error" || type === "warning") error = message; } },
+            });
+            if (error) throw new Error(error);
+         }
+      },
+   });
+   tool.configureSettings(initialSettings);
+   return tool;
 }
 
 async function rejectedError(promise: Promise<unknown>): Promise<Error> {
@@ -257,3630 +282,1299 @@ async function rejectedError(promise: Promise<unknown>): Promise<Error> {
 }
 
 function createTheme() {
-   return {
-      fg: (_color: string, text: string) => text,
-      bold: (text: string) => text,
-   };
+   return { fg: (_color: string, text: string) => text, bold: (text: string) => text };
 }
 
-function renderSingleSelectFromFactory(factory: unknown, width = 120): string {
-   // The custom UI callback is untyped in the test harness; narrow only the surface exercised here.
-   const createComponent = factory as unknown as (
-      tui: unknown,
-      theme: unknown,
-      keybindings: unknown,
-      done: () => void,
-   ) => { singleSelectList: { render: (renderWidth: number) => string[] } };
-   const component = createComponent(
-      { requestRender() { }, terminal: { rows: 24 } },
-      createTheme(),
-      createKeybindings(),
-      () => { },
-   );
-   return component.singleSelectList.render(width).join("\n");
+// ---- Fixture builders for the current contract ---------------------------
+
+function opt(label: string, description?: string, preview?: string) {
+   return preview === undefined
+      ? { label, description: description ?? `${label} detail` }
+      : { label, description: description ?? `${label} detail`, preview };
+}
+/** Two valid options, the minimum the schema accepts. */
+function opts2(a = "Alpha", b = "Beta") { return [opt(a), opt(b)]; }
+/** One questions entry; header defaults to the question text. */
+function entry(question: string, options = opts2(), extra: Record<string, unknown> = {}) {
+   return { question, header: question, options, ...extra };
+}
+/** A full tool payload holding exactly one question. */
+function oneQuestion(extra: Record<string, unknown> = {}) {
+   const { question = "Continue?", options, ...rest } = extra;
+   return { questions: [entry(question as string, (options as any) ?? opts2(), rest)] };
+}
+/** A full tool payload with several questions. */
+function batch(entries: Array<Record<string, unknown>>) {
+   return { questions: entries.map((each) => entry((each.question as string) ?? "Q?", each.options as any, each)) };
 }
 
-describe("ask_user", () => {
-   test("registers with executionMode 'sequential' so the agent loop awaits the user's answer before other tool calls run", async () => {
-      const tool = await setupTool();
-      expect((tool as any).executionMode).toBe("sequential");
-   });
-
-   test("emits Herdr blocked lifecycle while awaiting a structured answer", async () => {
-      const tool = await setupTool();
-
-      await tool.execute(
-         "tool-call-id",
-         { question: "Continue?", options: ["Yes"] },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: { custom: async () => ({ kind: "selection", selections: ["Yes"] }) },
+/** Mounts the prompt synchronously; drive keys through `state.component`. */
+function mountPrompt(rows = 24) {
+   const state: { component?: any; settled: boolean; answers: any } = { settled: false, answers: null };
+   const custom = async (factory: any) => await new Promise((resolve) => {
+      state.component = factory(
+         { requestRender() { }, terminal: { rows } },
+         createTheme(),
+         createKeybindings(),
+         (value: unknown) => {
+            state.settled = true;
+            state.answers = value;
+            resolve(value);
          },
       );
+   });
+   return { state, ui: { custom } };
+}
 
+const press = (component: any, ...keys: string[]) => keys.forEach((key) => component.handleInput(key));
+
+// ==========================================================================
+// Registration and schema contract
+// ==========================================================================
+
+describe("ask_user_question registration and schema", () => {
+   test("registers as ask_user_question with executionMode 'sequential'", async () => {
+      const tool = await setupTool();
+      expect((tool as any).name).toBe("ask_user_question");
+      expect(tool.executionMode).toBe("sequential");
+   });
+
+   test("exposes questions as the only top-level parameter", async () => {
+      const tool = await setupTool();
+      expect(tool.parameters.required).toEqual(["questions"]);
+      expect(tool.parameters.additionalProperties).toBe(false);
+      expect(Object.keys(tool.parameters.properties).sort()).toEqual(["questions"]);
+   });
+
+   test("questions items require question, header and 2-4 options", async () => {
+      const tool = await setupTool();
+      const items = tool.parameters.properties.questions.items;
+      expect(items.type).toBe("object");
+      expect([...items.required].sort()).toEqual(["header", "options", "question"]);
+      expect(items.properties.options.minItems).toBe(2);
+      expect(items.properties.options.maxItems).toBe(4);
+      expect([...items.properties.options.items.required].sort()).toEqual(["description", "label"]);
+      expect(items.properties.options.items.properties.preview).toBeTruthy();
+      expect(tool.parameters.properties.questions.minItems).toBe(1);
+      expect(tool.parameters.properties.questions.maxItems).toBe(4);
+   });
+
+   test("multiSelect is optional and boolean", async () => {
+      const tool = await setupTool();
+      const items = tool.parameters.properties.questions.items;
+      expect(items.properties.multiSelect.type).toBe("boolean");
+      expect(items.required).not.toContain("multiSelect");
+   });
+
+   test("emits the herdr:blocked lifecycle around an answer", async () => {
+      const tool = await setupTool();
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", oneQuestion(), undefined, undefined, { hasUI: true, ui });
+      press(state.component, "enter");
+      await execution;
       expect(emittedEvents.filter((event) => event.name === "herdr:blocked")).toEqual([
          { name: "herdr:blocked", payload: { active: true, label: "Waiting for user response" } },
          { name: "herdr:blocked", payload: { active: false } },
       ]);
    });
 
-   test("emits Herdr blocked lifecycle while awaiting a freeform answer", async () => {
+   test("clears herdr:blocked when the UI rejects", async () => {
       const tool = await setupTool();
-
-      await tool.execute(
-         "tool-call-id",
-         { question: "Why?", options: [] },
-         undefined,
-         undefined,
-         { hasUI: true, ui: { input: async () => "Because" } },
-      );
-
-      expect(emittedEvents.filter((event) => event.name === "herdr:blocked")).toEqual([
-         { name: "herdr:blocked", payload: { active: true, label: "Waiting for user response" } },
-         { name: "herdr:blocked", payload: { active: false } },
-      ]);
-   });
-
-   test("throws and clears Herdr blocked lifecycle when structured UI rejects", async () => {
-      const tool = await setupTool();
-
-      const error = await rejectedError(tool.execute(
-         "tool-call-id",
-         { question: "Continue?", options: ["Yes"] },
-         undefined,
-         undefined,
-         { hasUI: true, ui: { custom: async () => { throw new Error("UI failed"); } } },
-      ));
-
+      const error = await rejectedError(tool.execute("id", oneQuestion(), undefined, undefined, {
+         hasUI: true,
+         ui: { custom: async () => { throw new Error("UI failed"); } },
+      }));
       expect(error.message).toBe("UI failed");
-      expect(emittedEvents.filter((event) => event.name === "herdr:blocked")).toEqual([
-         { name: "herdr:blocked", payload: { active: true, label: "Waiting for user response" } },
-         { name: "herdr:blocked", payload: { active: false } },
-      ]);
+      expect(emittedEvents.filter((event) => event.name === "herdr:blocked").map((event) => event.payload.active))
+         .toEqual([true, false]);
    });
 
    test("throws when interactive UI is unavailable", async () => {
       const tool = await setupTool();
-
-      const error = await rejectedError(tool.execute(
-         "tool-call-id",
-         { question: "Continue?", options: ["Yes", "No"] },
-         undefined,
-         undefined,
-         { hasUI: false },
-      ));
-
-      expect(error.message).toContain("Ask requires interactive mode");
-      expect(error.message).toContain("Continue?");
-      expect(error.message).toContain("1. Yes");
-      expect(error.message).toContain("2. No");
+      const error = await rejectedError(tool.execute("id", oneQuestion(), undefined, undefined, { hasUI: false }));
+      expect(error.message).toContain("requires interactive mode");
+      expect(error.message).toContain("You can also answer freely.");
    });
 
-   test("clears Herdr blocked lifecycle when freeform input is cancelled", async () => {
+   test("no longer emits ask:* events", async () => {
       const tool = await setupTool();
-
-      const result = await tool.execute(
-         "tool-call-id",
-         { question: "Why?", options: [] },
-         undefined,
-         undefined,
-         { hasUI: true, ui: { input: async () => undefined } },
-      );
-
-      expect(result.details.cancelled).toBe(true);
-      expect(emittedEvents.filter((event) => event.name === "herdr:blocked")).toEqual([
-         { name: "herdr:blocked", payload: { active: true, label: "Waiting for user response" } },
-         { name: "herdr:blocked", payload: { active: false } },
-      ]);
-   });
-
-   describe("issue #51 event payload redaction", () => {
-      const answerFreeform = (tool: RegisteredTool) =>
-         tool.execute(
-            "tool-call-id",
-            { question: "Why?", context: "secret context", options: [] },
-            undefined,
-            undefined,
-            { hasUI: true, ui: { input: async () => "my private answer" } },
-         );
-      const cancelStructured = (tool: RegisteredTool) =>
-         tool.execute(
-            "tool-call-id",
-            { question: "Pick", context: "secret context", options: ["A", "B"] },
-            undefined,
-            undefined,
-            { hasUI: true, ui: { custom: async () => null } },
-         );
-
-      test("ask:answered carries only the question and response kind by default", async () => {
-         const tool = await setupTool();
-         const result = await answerFreeform(tool);
-
-         expect(result.details.response).toEqual({ kind: "freeform", text: "my private answer" });
-         expect(emittedEvents.filter((event) => event.name === "ask:answered")).toEqual([
-            { name: "ask:answered", payload: { question: "Why?", response: { kind: "freeform" } } },
-         ]);
-      });
-
-      test("ask:cancelled carries only the question by default", async () => {
-         const tool = await setupTool();
-         const result = await cancelStructured(tool);
-
-         expect(result.details.cancelled).toBe(true);
-         expect(emittedEvents.filter((event) => event.name === "ask:cancelled")).toEqual([
-            { name: "ask:cancelled", payload: { question: "Pick" } },
-         ]);
-      });
-
-      test("PI_ASK_USER_EMIT_FULL_EVENTS=true restores the full payloads", async () => {
-         stubEnv("PI_ASK_USER_EMIT_FULL_EVENTS", "true");
-         const tool = await setupTool();
-         await answerFreeform(tool);
-         await cancelStructured(tool);
-
-         expect(emittedEvents.filter((event) => event.name.startsWith("ask:"))).toEqual([
-            {
-               name: "ask:answered",
-               payload: { question: "Why?", context: "secret context", response: { kind: "freeform", text: "my private answer" } },
-            },
-            {
-               name: "ask:cancelled",
-               payload: {
-                  question: "Pick",
-                  context: "secret context",
-                  options: [{ title: "A" }, { title: "B" }],
-               },
-            },
-         ]);
-      });
-   });
-
-   test("uses overlay mode by default", async () => {
-      const tool = await setupTool();
-      let capturedOptions: any;
-
-      await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["A", "B"],
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (_factory: any, options: any) => {
-                  capturedOptions = options;
-                  return null;
-               },
-            },
-         },
-      );
-
-      expect(capturedOptions.overlay).toBe(true);
-      expect(capturedOptions.overlayOptions.visible).toBeUndefined();
-   });
-
-   test("uses non-overlay custom UI when displayMode is inline", async () => {
-      const tool = await setupTool();
-      let capturedOptions: any;
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["A", "B"],
-            displayMode: "inline",
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (_factory: any, options: any) => {
-                  capturedOptions = options;
-                  return null;
-               },
-            },
-         },
-      );
-
-      expect(capturedOptions).toBeUndefined();
-      expect(result.details.cancelled).toBe(true);
-   });
-
-   test("inline mode resolves with the user's selection", async () => {
-      const tool = await setupTool();
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["A", "B"],
-            displayMode: "inline",
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) =>
-                  await new Promise((resolve) => {
-                     factory(
-                        { requestRender() { }, terminal: { rows: 24 } },
-                        createTheme(),
-                        createKeybindings(),
-                        resolve,
-                     );
-                     resolve({ kind: "selection", selections: ["A"] });
-                  }),
-            },
-         },
-      );
-
-      expect(result.details.cancelled).toBe(false);
-      expect(result.details.response).toEqual({ kind: "selection", selections: ["A"] });
-   });
-
-   test("inline mode still respects timeout cancellation", async () => {
-      const tool = await setupTool();
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["A", "B"],
-            displayMode: "inline",
-            timeout: 5,
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) =>
-                  await new Promise((resolve) => {
-                     factory(
-                        { requestRender() { }, terminal: { rows: 24 } },
-                        createTheme(),
-                        createKeybindings(),
-                        resolve,
-                     );
-                  }),
-            },
-         },
-      );
-
-      expect(result.details.cancelled).toBe(true);
-      expect(result.details.response).toBeNull();
-   });
-
-   test("uses PI_ASK_USER_DISPLAY_MODE env var when call-level displayMode is omitted", async () => {
-      stubEnv("PI_ASK_USER_DISPLAY_MODE", "inline");
-      const tool = await setupTool();
-      let capturedOptions: any;
-
-      await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["A", "B"],
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (_factory: any, options: any) => {
-                  capturedOptions = options;
-                  return null;
-               },
-            },
-         },
-      );
-
-      expect(capturedOptions).toBeUndefined();
-   });
-
-   test("normalizes PI_ASK_USER_DISPLAY_MODE before applying it", async () => {
-      stubEnv("PI_ASK_USER_DISPLAY_MODE", " INLINE ");
-      const tool = await setupTool();
-      let capturedOptions: unknown;
-
-      await tool.execute(
-         "tool-call-id",
-         { question: "Which option should we use?", options: ["A", "B"] },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (_factory: unknown, options: unknown) => {
-                  capturedOptions = options;
-                  return null;
-               },
-            },
-         },
-      );
-
-      expect(capturedOptions).toBeUndefined();
-   });
-
-   test("call-level displayMode overrides PI_ASK_USER_DISPLAY_MODE env var", async () => {
-      stubEnv("PI_ASK_USER_DISPLAY_MODE", "inline");
-      const tool = await setupTool();
-      let capturedOptions: any;
-
-      await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["A", "B"],
-            displayMode: "overlay",
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (_factory: any, options: any) => {
-                  capturedOptions = options;
-                  return null;
-               },
-            },
-         },
-      );
-
-      expect(capturedOptions.overlay).toBe(true);
-   });
-
-   test("ignores unrecognised PI_ASK_USER_DISPLAY_MODE value and falls back to overlay", async () => {
-      stubEnv("PI_ASK_USER_DISPLAY_MODE", "fullscreen");
-      const tool = await setupTool();
-      let capturedOptions: any;
-
-      await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["A", "B"],
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (_factory: any, options: any) => {
-                  capturedOptions = options;
-                  return null;
-               },
-            },
-         },
-      );
-
-      expect(capturedOptions.overlay).toBe(true);
-   });
-
-   describe("overlay hide/show toggle (alt+o)", () => {
-      function createOverlayHandle() {
-         let hidden = false;
-         const calls: boolean[] = [];
-         return {
-            handle: {
-               hide() { },
-               setHidden(value: boolean) {
-                  hidden = value;
-                  calls.push(value);
-               },
-               isHidden() {
-                  return hidden;
-               },
-               focus() { },
-               unfocus() { },
-               isFocused() {
-                  return false;
-               },
-            },
-            calls,
-         };
-      }
-
-      test("registers an onTerminalInput listener and passes onHandle in overlay mode", async () => {
-         const tool = await setupTool();
-         let capturedOptions: any;
-         let inputHandler: ((data: string) => any) | undefined;
-         let unsubscribed = false;
-
-         await tool.execute(
-            "tool-call-id",
-            { question: "Q", options: ["A"] },
-            undefined,
-            undefined,
-            {
-               hasUI: true,
-               ui: {
-                  custom: async (_factory: any, options: any) => {
-                     capturedOptions = options;
-                     return null;
-                  },
-                  onTerminalInput: (handler: (data: string) => any) => {
-                     inputHandler = handler;
-                     return () => {
-                        unsubscribed = true;
-                     };
-                  },
-                  notify: () => { },
-               },
-            },
-         );
-
-         expect(typeof capturedOptions.onHandle).toBe("function");
-         expect(typeof inputHandler).toBe("function");
-         expect(unsubscribed).toBe(true);
-      });
-
-      test("does not register onTerminalInput in inline mode", async () => {
-         const tool = await setupTool();
-         let registered = false;
-
-         await tool.execute(
-            "tool-call-id",
-            { question: "Q", options: ["A"], displayMode: "inline" },
-            undefined,
-            undefined,
-            {
-               hasUI: true,
-               ui: {
-                  custom: async () => null,
-                  onTerminalInput: () => {
-                     registered = true;
-                     return () => { };
-                  },
-               },
-            },
-         );
-
-         expect(registered).toBe(false);
-      });
-
-      test("alt+o toggles overlay visibility via OverlayHandle.setHidden", async () => {
-         const tool = await setupTool();
-         const { handle, calls } = createOverlayHandle();
-         let inputHandler: ((data: string) => any) | undefined;
-         const notifications: Array<{ message: string; type?: string }> = [];
-
-         await tool.execute(
-            "tool-call-id",
-            { question: "Q", options: ["A"] },
-            undefined,
-            undefined,
-            {
-               hasUI: true,
-               ui: {
-                  custom: async (_factory: any, options: any) => {
-                     options.onHandle?.(handle);
-                     // Kitty progressive keyboard reporting emits repeat and
-                     // release events in addition to the initial press. They
-                     // must be consumed without toggling the overlay again.
-                     const firstResult = inputHandler?.("\x1b[111;3:1u");
-                     const repeatResult = inputHandler?.("\x1b[111;3:2u");
-                     const releaseResult = inputHandler?.("\x1b[111;3:3u");
-                     const secondResult = inputHandler?.("\x1b[111;3:1u");
-                     expect(firstResult).toEqual({ consume: true });
-                     expect(repeatResult).toEqual({ consume: true });
-                     expect(releaseResult).toEqual({ consume: true });
-                     expect(secondResult).toEqual({ consume: true });
-                     return null;
-                  },
-                  onTerminalInput: (handler: (data: string) => any) => {
-                     inputHandler = handler;
-                     return () => { };
-                  },
-                  notify: (message: string, type?: string) => {
-                     notifications.push({ message, type });
-                  },
-               },
-            },
-         );
-
-         expect(calls).toEqual([true, false]);
-         expect(notifications).toHaveLength(1);
-         expect(notifications[0]?.message).toContain("alt+o");
-         expect(notifications[0]?.type).toBe("info");
-      });
-
-      test("does not consume ctrl+o from the terminal listener", async () => {
-         const tool = await setupTool();
-         const { handle, calls } = createOverlayHandle();
-         let inputHandler: ((data: string) => any) | undefined;
-
-         await tool.execute(
-            "tool-call-id",
-            { question: "Q", options: ["A"] },
-            undefined,
-            undefined,
-            {
-               hasUI: true,
-               ui: {
-                  custom: async (_factory: any, options: any) => {
-                     options.onHandle?.(handle);
-                     const result = inputHandler?.("ctrl+o");
-                     expect(result).toBeUndefined();
-                     return null;
-                  },
-                  onTerminalInput: (handler: (data: string) => any) => {
-                     inputHandler = handler;
-                     return () => { };
-                  },
-                  notify: () => { },
-               },
-            },
-         );
-
-         expect(calls).toEqual([]);
-      });
-
-      test("does not force a hidden overlay visible during cleanup", async () => {
-         const tool = await setupTool();
-         const { handle, calls } = createOverlayHandle();
-         let inputHandler: ((data: string) => any) | undefined;
-
-         await tool.execute(
-            "tool-call-id",
-            { question: "Q", options: ["A"] },
-            undefined,
-            undefined,
-            {
-               hasUI: true,
-               ui: {
-                  custom: async (_factory: any, options: any) => {
-                     options.onHandle?.(handle);
-                     // Hide and resolve while still hidden.
-                     inputHandler?.("alt+o");
-                     return null;
-                  },
-                  onTerminalInput: (handler: (data: string) => any) => {
-                     inputHandler = handler;
-                     return () => { };
-                  },
-                  notify: () => { },
-               },
-            },
-         );
-
-         expect(calls).toEqual([true]);
-      });
-
-      test("per-call overlayToggleKey replaces the default alt+o binding", async () => {
-         const tool = await setupTool();
-         const { handle, calls } = createOverlayHandle();
-         let inputHandler: ((data: string) => any) | undefined;
-         const notifications: Array<{ message: string; type?: string }> = [];
-
-         await tool.execute(
-            "tool-call-id",
-            { question: "Q", options: ["A"], overlayToggleKey: "alt+h" },
-            undefined,
-            undefined,
-            {
-               hasUI: true,
-               ui: {
-                  custom: async (_factory: any, options: any) => {
-                     options.onHandle?.(handle);
-                     const ignored = inputHandler?.("alt+o");
-                     const consumed = inputHandler?.("alt+h");
-                     expect(ignored).toBeUndefined();
-                     expect(consumed).toEqual({ consume: true });
-                     return null;
-                  },
-                  onTerminalInput: (handler: (data: string) => any) => {
-                     inputHandler = handler;
-                     return () => { };
-                  },
-                  notify: (message: string, type?: string) => {
-                     notifications.push({ message, type });
-                  },
-               },
-            },
-         );
-
-         expect(calls).toEqual([true]);
-         expect(notifications).toHaveLength(1);
-         expect(notifications[0]?.message).toContain("alt+h");
-      });
-
-      test("PI_ASK_USER_OVERLAY_TOGGLE_KEY env var overrides default", async () => {
-         stubEnv("PI_ASK_USER_OVERLAY_TOGGLE_KEY", "alt+h");
-         const tool = await setupTool();
-         const { handle, calls } = createOverlayHandle();
-         let inputHandler: ((data: string) => any) | undefined;
-
-         await tool.execute(
-            "tool-call-id",
-            { question: "Q", options: ["A"] },
-            undefined,
-            undefined,
-            {
-               hasUI: true,
-               ui: {
-                  custom: async (_factory: any, options: any) => {
-                     options.onHandle?.(handle);
-                     const ignored = inputHandler?.("alt+o");
-                     const consumed = inputHandler?.("alt+h");
-                     expect(ignored).toBeUndefined();
-                     expect(consumed).toEqual({ consume: true });
-                     return null;
-                  },
-                  onTerminalInput: (handler: (data: string) => any) => {
-                     inputHandler = handler;
-                     return () => { };
-                  },
-                  notify: () => { },
-               },
-            },
-         );
-
-         expect(calls).toEqual([true]);
-      });
-
-      test("per-call overlayToggleKey wins over env var", async () => {
-         stubEnv("PI_ASK_USER_OVERLAY_TOGGLE_KEY", "alt+h");
-         const tool = await setupTool();
-         const { handle, calls } = createOverlayHandle();
-         let inputHandler: ((data: string) => any) | undefined;
-
-         await tool.execute(
-            "tool-call-id",
-            { question: "Q", options: ["A"], overlayToggleKey: "alt+x" },
-            undefined,
-            undefined,
-            {
-               hasUI: true,
-               ui: {
-                  custom: async (_factory: any, options: any) => {
-                     options.onHandle?.(handle);
-                     const ignoredEnv = inputHandler?.("alt+h");
-                     const consumed = inputHandler?.("alt+x");
-                     expect(ignoredEnv).toBeUndefined();
-                     expect(consumed).toEqual({ consume: true });
-                     return null;
-                  },
-                  onTerminalInput: (handler: (data: string) => any) => {
-                     inputHandler = handler;
-                     return () => { };
-                  },
-                  notify: () => { },
-               },
-            },
-         );
-
-         expect(calls).toEqual([true]);
-      });
-
-      test("overlayToggleKey 'off' disables the listener entirely", async () => {
-         const tool = await setupTool();
-         let registered = false;
-
-         await tool.execute(
-            "tool-call-id",
-            { question: "Q", options: ["A"], overlayToggleKey: "off" },
-            undefined,
-            undefined,
-            {
-               hasUI: true,
-               ui: {
-                  custom: async () => null,
-                  onTerminalInput: () => {
-                     registered = true;
-                     return () => { };
-                  },
-               },
-            },
-         );
-
-         expect(registered).toBe(false);
-      });
-
-      test("invalid overlayToggleKey falls through to env var", async () => {
-         stubEnv("PI_ASK_USER_OVERLAY_TOGGLE_KEY", "alt+h");
-         const tool = await setupTool();
-         const { handle, calls } = createOverlayHandle();
-         let inputHandler: ((data: string) => any) | undefined;
-
-         await tool.execute(
-            "tool-call-id",
-            { question: "Q", options: ["A"], overlayToggleKey: "++bad++" },
-            undefined,
-            undefined,
-            {
-               hasUI: true,
-               ui: {
-                  custom: async (_factory: any, options: any) => {
-                     options.onHandle?.(handle);
-                     const consumed = inputHandler?.("alt+h");
-                     expect(consumed).toEqual({ consume: true });
-                     return null;
-                  },
-                  onTerminalInput: (handler: (data: string) => any) => {
-                     inputHandler = handler;
-                     return () => { };
-                  },
-                  notify: () => { },
-               },
-            },
-         );
-
-         expect(calls).toEqual([true]);
-      });
-   });
-
-   test("renders partial updates as waiting state instead of a successful empty answer", async () => {
-      const tool = await setupTool();
-      let partialUpdate: any;
-
-      await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["A", "B"],
-         },
-         undefined,
-         (update: any) => {
-            partialUpdate = update;
-         },
-         {
-            hasUI: true,
-            ui: {
-               custom: async () => null,
-            },
-         },
-      );
-
-      const component = tool.renderResult(partialUpdate, { expanded: false, isPartial: true }, createTheme()) as any;
-      const rendered = component.render(120).join("\n");
-
-      expect(rendered).toContain("Waiting for user input...");
-      expect(rendered).not.toContain("✓");
-   });
-
-   test("renders thrown tool failures as errors", async () => {
-      const tool = await setupTool();
-      const component = tool.renderResult(
-         { content: [{ type: "text", text: "UI failed" }], details: undefined },
-         { expanded: false, isPartial: false },
-         createTheme(),
-         { isError: true },
-      ) as any;
-
-      const rendered = component.render(120).join("\n");
-
-      expect(rendered).toContain("✗ UI failed");
-      expect(rendered).not.toContain("Cancelled");
-   });
-
-   test("marks each selected option in expanded multi-select results", async () => {
-      const tool = await setupTool();
-      const component = tool.renderResult(
-         {
-            content: [{ type: "text", text: "User answered: A, B" }],
-            details: {
-               question: "Choose one or more",
-               options: [{ title: "A" }, { title: "B" }, { title: "C" }],
-               response: { kind: "selection", selections: ["A", "B"] },
-               cancelled: false,
-            },
-         },
-         { expanded: true, isPartial: false },
-         createTheme(),
-      ) as any;
-
-      const rendered = component.render(120).join("\n");
-
-      expect(rendered).toContain("● A");
-      expect(rendered).toContain("● B");
-      expect(rendered).toContain("○ C");
-   });
-
-   test("renders selection comments separately in expanded results", async () => {
-      const tool = await setupTool();
-      const component = tool.renderResult(
-         {
-            content: [{ type: "text", text: "User answered: Blue" }],
-            details: {
-               question: "Pick a color",
-               options: [{ title: "Red" }, { title: "Blue" }, { title: "Green" }],
-               response: { kind: "selection", selections: ["Blue"], comment: "Match the current brand palette." },
-               cancelled: false,
-            },
-         },
-         { expanded: true, isPartial: false },
-         createTheme(),
-      ) as any;
-
-      const rendered = component.render(120).join("\n");
-
-      expect(rendered).toContain("● Blue");
-      expect(rendered).toContain("Comment:");
-      expect(rendered).toContain("Match the current brand palette.");
-   });
-
-
-   test("enters freeform mode without editor theme crashes", async () => {
-      const tool = await setupTool();
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["A", "B"],
-            allowFreeform: true,
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 24 } },
-                     createTheme(),
-                     createKeybindings(),
-                     () => { },
-                  );
-
-                  component.handleInput("down");
-                  component.handleInput("down");
-                  component.handleInput("enter");
-
-                  return null;
-               },
-            },
-         },
-      );
-
-      expect(result.isError).not.toBe(true);
-      expect(result.details.cancelled).toBe(true);
-   });
-
-   test("uses shared confirm keybinding in single-select mode", async () => {
-      const tool = await setupTool();
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["A", "B"],
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  let resolved: string | null | undefined;
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 24 } },
-                     createTheme(),
-                     createKeybindings({ "tui.select.confirm": ["x"] }),
-                     (value: string | null) => {
-                        resolved = value;
-                     },
-                  );
-
-                  component.handleInput("x");
-                  return resolved ?? null;
-               },
-            },
-         },
-      );
-
-      expect(result.isError).not.toBe(true);
-      expect(result.details.response).toEqual({ kind: "selection", selections: ["A"] });
-      expect(result.details.cancelled).toBe(false);
-   });
-
-   test("forwards ctrl+enter to the editor instead of submitting freeform mode", async () => {
-      const tool = await setupTool();
-      editorInputs = [];
-      editorText = "draft answer";
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["A", "B"],
-            allowFreeform: true,
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  let resolved: string | null | undefined;
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 24 } },
-                     createTheme(),
-                     createKeybindings(),
-                     (value: string | null) => {
-                        resolved = value;
-                     },
-                  );
-
-                  component.handleInput("down");
-                  component.handleInput("down");
-                  component.handleInput("enter");
-                  component.handleInput("ctrl+enter");
-
-                  return resolved ?? null;
-               },
-            },
-         },
-      );
-
-      expect(result.isError).not.toBe(true);
-      expect(result.details.cancelled).toBe(true);
-      expect(editorInputs).toEqual(["ctrl+enter"]);
-   });
-
-   test("filters single-select options from typed search before confirming", async () => {
-      const tool = await setupTool();
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["Alpha", "Beta", "Gamma"],
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  let resolved: string | null | undefined;
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 24 } },
-                     createTheme(),
-                     createKeybindings(),
-                     (value: string | null) => {
-                        resolved = value;
-                     },
-                  );
-
-                  component.handleInput("b");
-                  component.handleInput("enter");
-                  return resolved ?? null;
-               },
-            },
-         },
-      );
-
-      expect(result.isError).not.toBe(true);
-      expect(result.details.response).toEqual({ kind: "selection", selections: ["Beta"] });
-      expect(result.details.cancelled).toBe(false);
-   });
-
-   test("navigates single-select options with ctrl+j (vim down)", async () => {
-      const tool = await setupTool();
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["Alpha", "Beta", "Gamma"],
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  let resolved: string | null | undefined;
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 24 } },
-                     createTheme(),
-                     createKeybindings(),
-                     (value: string | null) => {
-                        resolved = value;
-                     },
-                  );
-
-                  component.handleInput("ctrl+j");
-                  component.handleInput("enter");
-                  return resolved ?? null;
-               },
-            },
-         },
-      );
-
-      expect(result.isError).not.toBe(true);
-      expect(result.details.response).toEqual({ kind: "selection", selections: ["Beta"] });
-      expect(result.details.cancelled).toBe(false);
-   });
-
-   test("wraps to last option when ctrl+k (vim up) is pressed at the top", async () => {
-      const tool = await setupTool();
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["Alpha", "Beta", "Gamma"],
-            allowFreeform: false,
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  let resolved: string | null | undefined;
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 24 } },
-                     createTheme(),
-                     createKeybindings(),
-                     (value: string | null) => {
-                        resolved = value;
-                     },
-                  );
-
-                  component.handleInput("ctrl+k");
-                  component.handleInput("enter");
-                  return resolved ?? null;
-               },
-            },
-         },
-      );
-
-      expect(result.isError).not.toBe(true);
-      expect(result.details.response).toEqual({ kind: "selection", selections: ["Gamma"] });
-      expect(result.details.cancelled).toBe(false);
-   });
-
-   test("treats bare j as fuzzy-search input rather than navigation", async () => {
-      const tool = await setupTool();
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["Alpha", "June", "Gamma"],
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  let resolved: string | null | undefined;
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 24 } },
-                     createTheme(),
-                     createKeybindings(),
-                     (value: string | null) => {
-                        resolved = value;
-                     },
-                  );
-
-                  component.handleInput("j");
-                  component.handleInput("enter");
-                  return resolved ?? null;
-               },
-            },
-         },
-      );
-
-      expect(result.isError).not.toBe(true);
-      expect(result.details.response).toEqual({ kind: "selection", selections: ["June"] });
-      expect(result.details.cancelled).toBe(false);
-   });
-
-   test("navigates multi-select options with ctrl+j before toggling", async () => {
-      const tool = await setupTool();
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which options should we use?",
-            options: ["Alpha", "Beta", "Gamma"],
-            allowMultiple: true,
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  let resolved: any;
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 24 } },
-                     createTheme(),
-                     createKeybindings(),
-                     (value: any) => {
-                        resolved = value;
-                     },
-                  );
-
-                  component.handleInput("ctrl+j");
-                  component.handleInput("space");
-                  component.handleInput("enter");
-                  return resolved ?? null;
-               },
-            },
-         },
-      );
-
-      expect(result.isError).not.toBe(true);
-      expect(result.details.response).toEqual({ kind: "selection", selections: ["Beta"] });
-      expect(result.details.cancelled).toBe(false);
-   });
-
-   test("keeps single-select search usable when comment toggling is enabled", async () => {
-      const tool = await setupTool();
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["Chrome", "Firefox", "Safari"],
-            allowComment: true,
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  let resolved: string | null | undefined;
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 24 } },
-                     createTheme(),
-                     createKeybindings(),
-                     (value: string | null) => {
-                        resolved = value;
-                     },
-                  );
-
-                  component.handleInput("c");
-                  component.handleInput("enter");
-                  return resolved ?? null;
-               },
-            },
-         },
-      );
-
-      expect(result.isError).not.toBe(true);
-      expect(result.details.response).toEqual({ kind: "selection", selections: ["Chrome"] });
-      expect(result.details.cancelled).toBe(false);
-   });
-
-   test("uses PI_ASK_USER_ALLOW_COMMENT when allowComment is omitted", async () => {
-      stubEnv("PI_ASK_USER_ALLOW_COMMENT", "true");
-      const tool = await setupTool();
-
-      const result = await tool.execute(
-         "tool-call-id",
-         { question: "Which option should we use?", options: ["Chrome", "Firefox"] },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: AskComponentFactory) => {
-                  let resolved: unknown;
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 24 } },
-                     createTheme(),
-                     createKeybindings(),
-                     (value) => { resolved = value; },
-                  );
-                  component.handleInput("ctrl+g");
-                  component.handleInput("enter");
-                  // Discriminator: with the env preference applied, the first
-                  // enter enters comment mode instead of resolving.
-                  expect(resolved).toBeUndefined();
-                  editorText = "Prefer the default browser everywhere.";
-                  component.handleInput("enter");
-                  return resolved ?? null;
-               },
-            },
-         },
-      );
-
-      expect(result.details.response).toEqual({
-         kind: "selection",
-         selections: ["Chrome"],
-         comment: "Prefer the default browser everywhere.",
-      });
-   });
-
-   test("call-level allowComment false overrides PI_ASK_USER_ALLOW_COMMENT", async () => {
-      stubEnv("PI_ASK_USER_ALLOW_COMMENT", "true");
-      const tool = await setupTool();
-
-      const result = await tool.execute(
-         "tool-call-id",
-         { question: "Which option should we use?", options: ["Chrome", "Firefox"], allowComment: false },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: AskComponentFactory) => {
-                  let resolved: unknown;
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 24 } },
-                     createTheme(),
-                     createKeybindings(),
-                     (value) => { resolved = value; },
-                  );
-                  component.handleInput("ctrl+g");
-                  component.handleInput("enter");
-                  // Discriminator: per-call false wins, so ctrl+g is a no-op
-                  // and the first enter resolves the selection immediately.
-                  expect(resolved).not.toBeUndefined();
-                  return resolved ?? null;
-               },
-            },
-         },
-      );
-
-      expect(result.details.response).toEqual({ kind: "selection", selections: ["Chrome"] });
-   });
-
-   test("treats out-of-range number keys as search input in single-select mode", async () => {
-      const tool = await setupTool();
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["Alpha", "Beta 7", "Gamma"],
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  let resolved: string | null | undefined;
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 24 } },
-                     createTheme(),
-                     createKeybindings(),
-                     (value: string | null) => {
-                        resolved = value;
-                     },
-                  );
-
-                  component.handleInput("7");
-                  component.handleInput("enter");
-                  return resolved ?? null;
-               },
-            },
-         },
-      );
-
-      expect(result.isError).not.toBe(true);
-      expect(result.details.response).toEqual({ kind: "selection", selections: ["Beta 7"] });
-      expect(result.details.cancelled).toBe(false);
-   });
-
-   test("keeps freeform available when search filters out every option", async () => {
-      const tool = await setupTool();
-      editorInputs = [];
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["Alpha", "Beta"],
-            allowFreeform: true,
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  let resolved: string | null | undefined;
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 24 } },
-                     createTheme(),
-                     createKeybindings(),
-                     (value: string | null) => {
-                        resolved = value;
-                     },
-                  );
-
-                  component.handleInput("z");
-                  component.handleInput("z");
-                  component.handleInput("z");
-                  component.handleInput("enter");
-                  editorText = "custom from editor";
-                  component.handleInput("enter");
-                  return resolved ?? null;
-               },
-            },
-         },
-      );
-
-      const answeredEvent = emittedEvents.find((event) => event.name === "ask:answered");
-
-      expect(result.isError).not.toBe(true);
-      expect(result.details.response).toEqual({ kind: "freeform", text: "custom from editor" });
-      expect(result.details.cancelled).toBe(false);
-      expect(answeredEvent?.payload).toEqual({ question: "Which option should we use?", response: { kind: "freeform" } });
-      expect(editorInputs).toEqual(["enter"]);
-   });
-
-   test("shows the remapped cancel key in freeform help text", async () => {
-      const tool = await setupTool();
-      let helpText = "";
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["Alpha", "Beta"],
-            allowFreeform: true,
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 24 } },
-                     createTheme(),
-                     createKeybindings({ "tui.select.cancel": ["q"] }),
-                     () => { },
-                  );
-
-                  component.handleInput("down");
-                  component.handleInput("down");
-                  component.handleInput("enter");
-                  helpText = (component as any).helpText.render().join("\n");
-                  return null;
-               },
-            },
-         },
-      );
-
-      expect(result.isError).not.toBe(true);
-      expect(helpText).toContain("alt+o hide");
-      expect(helpText).toContain("q cancel");
-      expect(helpText).not.toContain("ctrl+c cancel");
-   });
-
-   test("renders a details pane for wide single-select layouts", async () => {
-      const tool = await setupTool();
-      let rendered = "";
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: [
-               { title: "Alpha", description: "The alpha option keeps the rollout conservative." },
-               { title: "Beta", description: "The beta option favors faster iteration." },
-            ],
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 24 } },
-                     createTheme(),
-                     createKeybindings(),
-                     () => { },
-                  );
-                  rendered = ((component as any).singleSelectList as any).render(120).join("\n");
-                  return null;
-               },
-            },
-         },
-      );
-
-      expect(result.isError).not.toBe(true);
-      expect(rendered).toContain("## Alpha");
-      expect(rendered).toContain("The alpha option keeps the rollout conservative.");
-   });
-
-   test("keeps wide single-select prompts in one column when requested", async () => {
-      const tool = await setupTool();
-      let rendered = "";
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: [
-               { title: "Alpha", description: "The alpha option stays below its title." },
-               { title: "Beta", description: "The beta option stays below its title." },
-            ],
-            singleSelectLayout: "list",
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: unknown) => {
-                  rendered = renderSingleSelectFromFactory(factory);
-                  return null;
-               },
-            },
-         },
-      );
-
-      expect(result.isError).not.toBe(true);
-      expect(rendered).toContain("The alpha option stays below its title.");
-      expect(rendered).not.toContain("## Alpha");
-      expect(rendered).not.toContain(" │ ");
-   });
-
-   test("uses PI_ASK_USER_SINGLE_SELECT_LAYOUT unless the call overrides it", async () => {
-      stubEnv("PI_ASK_USER_SINGLE_SELECT_LAYOUT", "list");
-      const tool = await setupTool();
-      const render = async (singleSelectLayout?: "auto") => {
-         let output = "";
-         await tool.execute(
-            "tool-call-id",
-            {
-               question: "Which option should we use?",
-               options: [{ title: "Alpha", description: "Alpha details." }],
-               singleSelectLayout,
-            },
-            undefined,
-            undefined,
-            {
-               hasUI: true,
-               ui: {
-                  custom: async (factory: unknown) => {
-                     output = renderSingleSelectFromFactory(factory);
-                     return null;
-                  },
-               },
-            },
-         );
-         return output;
-      };
-
-      expect(await render()).not.toContain("## Alpha");
-      expect(await render("auto")).toContain("## Alpha");
-   });
-
-   test("shows a custom response preview in the wide details pane", async () => {
-      const tool = await setupTool();
-      let rendered = "";
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["Alpha", "Beta"],
-            allowFreeform: true,
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 24 } },
-                     createTheme(),
-                     createKeybindings(),
-                     () => { },
-                  );
-                  component.handleInput("down");
-                  component.handleInput("down");
-                  rendered = ((component as any).singleSelectList as any).render(120).join("\n");
-                  return null;
-               },
-            },
-         },
-      );
-
-      expect(result.isError).not.toBe(true);
-      expect(rendered).toContain("Custom response");
-      expect(rendered).toContain("Open the editor to write **any** answer.");
-   });
-
-   test("falls back to the single-column list on narrow widths", async () => {
-      const tool = await setupTool();
-      let rendered = "";
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: [
-               { title: "Alpha", description: "The alpha option keeps the rollout conservative." },
-               { title: "Beta", description: "The beta option favors faster iteration." },
-            ],
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 24 } },
-                     createTheme(),
-                     createKeybindings(),
-                     () => { },
-                  );
-                  rendered = ((component as any).singleSelectList as any).render(60).join("\n");
-                  return null;
-               },
-            },
-         },
-      );
-
-      expect(result.isError).not.toBe(true);
-      expect(rendered).not.toContain("Details");
-      expect(rendered).not.toContain(" │ ");
-      expect(rendered).toContain("The alpha option keeps the rollout conservative.");
-   });
-
-   test.each([
-      { width: 40, rows: 12 },
-      { width: 60, rows: 20 },
-   ])("keeps the question, collapsed context, and a choice visible at $width x $rows", async ({ width, rows }) => {
-      const tool = await setupTool();
-      let rendered: string[] = [];
-
-      await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which deployment strategy should we use?",
-            context: "Decision-critical context detail. ".repeat(80),
-            options: ["Alpha", "Beta"],
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows } },
-                     createTheme(),
-                     createKeybindings(),
-                     () => { },
-                  );
-                  rendered = component.render(width);
-                  return null;
-               },
-            },
-         },
-      );
-
-      const joined = rendered.join("\n").replace(/\s+/g, " ");
-      expect(joined).toContain("Which deployment strategy should we");
-      expect(joined).toContain("use?");
-      expect(joined).toContain("→ 1. Alpha");
-      expect(joined).toContain("Context (");
-      expect(joined).toContain("ctrl+e");
-      expect(joined).not.toContain("Decision-critical context detail.");
-   });
-
-   test("expands and re-collapses long context without losing filtered selection", async () => {
-      const tool = await setupTool();
-      let collapsed = "";
-      let expanded = "";
-      let recollapsed = "";
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            context: "Context detail. ".repeat(80),
-            options: ["Alpha", "Beta"],
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  let resolved: unknown;
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 12 } },
-                     createTheme(),
-                     createKeybindings(),
-                     (value: unknown) => { resolved = value; },
-                  );
-                  component.handleInput("b");
-                  collapsed = component.render(50).join("\n");
-                  component.handleInput("ctrl+e");
-                  component.render(50);
-                  component.handleInput("end");
-                  expanded = component.render(50).join("\n");
-                  component.handleInput("ctrl+e");
-                  recollapsed = component.render(50).join("\n");
-                  component.handleInput("enter");
-                  return resolved ?? null;
-               },
-            },
-         },
-      );
-
-      expect(collapsed).toContain("Context (");
-      expect(expanded).toContain("Context detail.");
-      expect(expanded).toContain("Beta");
-      expect(recollapsed).not.toContain("Context detail.");
-      expect(result.details.response).toEqual({ kind: "selection", selections: ["Beta"] });
-      expect(result.details.context).toContain("Context detail.");
-   });
-
-   describe("issue #45 contextExpanded preference", () => {
-      const renderFirstFrame = async (tool: RegisteredTool, params: Record<string, unknown>) => {
-         let firstFrame = "";
-         await tool.execute(
-            "tool-call-id",
-            {
-               question: "Which option should we use?",
-               context: "Context detail. ".repeat(80),
-               options: ["Alpha", "Beta"],
-               ...params,
-            },
-            undefined,
-            undefined,
-            {
-               hasUI: true,
-               ui: {
-                  custom: async (factory: any) => {
-                     const component = factory(
-                        { requestRender() { }, terminal: { rows: 40 } },
-                        createTheme(),
-                        createKeybindings(),
-                        () => { },
-                     );
-                     firstFrame = component.render(50).join("\n");
-                     return null;
-                  },
-               },
-            },
-         );
-         return firstFrame;
-      };
-
-      test("per-call contextExpanded: true opens oversized context expanded", async () => {
-         const tool = await setupTool();
-         const frame = await renderFirstFrame(tool, { contextExpanded: true });
-         expect(frame).toContain("Context detail.");
-         expect(frame).not.toContain("Context (");
-         expect(frame).toContain("ctrl+e collapse context");
-      });
-
-      test("uses PI_ASK_USER_CONTEXT_EXPANDED when the call omits contextExpanded", async () => {
-         stubEnv("PI_ASK_USER_CONTEXT_EXPANDED", "true");
-         const tool = await setupTool();
-         const frame = await renderFirstFrame(tool, {});
-         expect(frame).toContain("Context detail.");
-         expect(frame).not.toContain("Context (");
-      });
-
-      test("per-call contextExpanded: false overrides PI_ASK_USER_CONTEXT_EXPANDED", async () => {
-         stubEnv("PI_ASK_USER_CONTEXT_EXPANDED", "true");
-         const tool = await setupTool();
-         const frame = await renderFirstFrame(tool, { contextExpanded: false });
-         expect(frame).toContain("Context (");
-         expect(frame).not.toContain("Context detail.");
-      });
-   });
-
-   test("scrolls constrained multi-select overlays to the comment and freeform rows", async () => {
-      const tool = await setupTool();
-      let initialRendered: string[] = [];
-      let commentRendered: string[] = [];
-      let freeformRendered: string[] = [];
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["Option 1", "Option 2", "Option 3", "Option 4"],
-            allowMultiple: true,
-            allowFreeform: true,
-            allowComment: true,
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 12 } },
-                     createTheme(),
-                     createKeybindings(),
-                     () => { },
-                  );
-
-                  initialRendered = component.render(50);
-                  for (let index = 0; index < 4; index += 1) component.handleInput("down");
-                  commentRendered = component.render(50);
-                  component.handleInput("down");
-                  freeformRendered = component.render(50);
-                  return null;
-               },
-            },
-         },
-      );
-
-      expect(result.isError).not.toBe(true);
-      expect(initialRendered.join("\n")).toContain("(1/6)");
-      expect(commentRendered.join("\n")).toContain("Add extra context after selection");
-      expect(commentRendered.join("\n")).toContain("(5/6)");
-      expect(commentRendered.join("\n")).not.toContain("…");
-      expect(freeformRendered.join("\n")).toContain("Type something.");
-      expect(freeformRendered.join("\n")).toContain("(6/6)");
-      expect(freeformRendered.join("\n")).not.toContain("…");
-   });
-
-   test("scrolls the prompt pane without hiding answers or help", async () => {
-      const tool = await setupTool();
-      let initialRendered: string[] = [];
-      let scrolledRendered: string[] = [];
-      let restoredRendered: string[] = [];
-
-      const question = Array.from({ length: 18 }, (_, index) => `Question line ${index}`).join("\n");
-      const context = Array.from({ length: 8 }, (_, index) => `Context line ${index}`).join("\n");
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question,
-            context,
-            options: ["Alpha", "Beta"],
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 12 } },
-                     createTheme(),
-                     createKeybindings(),
-                     () => { },
-                  );
-                  initialRendered = component.render(50);
-                  component.handleInput("ctrl+e");
-                  component.render(50);
-                  component.handleInput("end");
-                  scrolledRendered = component.render(50);
-                  component.handleInput("home");
-                  restoredRendered = component.render(50);
-                  return null;
-               },
-            },
-         },
-      );
-
-      expect(result.isError).not.toBe(true);
-      expect(initialRendered.join("\n")).toContain("Question line 0");
-      expect(scrolledRendered.join("\n")).toContain("Context line 7");
-      expect(scrolledRendered.join("\n")).toContain("Alpha");
-      expect(scrolledRendered.join("\n")).toContain("ctrl+e collapse context");
-      expect(scrolledRendered.join("\n")).toContain("PgUp/P");
-      expect(restoredRendered.join("\n")).toContain("Question line 0");
-   });
-
-   test("keeps multiple freeform editor rows visible in a constrained overlay", async () => {
-      const tool = await setupTool();
-      let rendered: string[] = [];
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            context: "Short context that should give way to the editor once freeform mode is active.",
-            options: ["Alpha", "Beta"],
-            allowFreeform: true,
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 12 } },
-                     createTheme(),
-                     createKeybindings(),
-                     () => { },
-                  );
-                  component.handleInput("down");
-                  component.handleInput("down");
-                  component.handleInput("enter");
-                  (component as any).editor.setText(
-                     Array.from({ length: 6 }, (_, index) => `editor line ${index}`).join("\n"),
-                  );
-                  rendered = component.render(50);
-                  return null;
-               },
-            },
-         },
-      );
-
-      const joined = rendered.join("\n");
-      expect(result.isError).not.toBe(true);
-      expect(rendered.length).toBeLessThanOrEqual(10);
-      expect(joined).toContain("Custom response");
-      expect(joined).toContain("editor line 4");
-      expect(joined).toContain("editor line 5");
-      expect(joined).toContain("enter submit");
-   });
-
-   test("routes PageUp/PageDown to the editor in freeform mode instead of prompt scrolling", async () => {
-      const tool = await setupTool();
-      editorInputs = [];
-
-      const question = Array.from({ length: 18 }, (_, index) => `Question line ${index}`).join("\n");
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question,
-            context: "Long overlay context so the prompt pane has scrollable overflow.",
-            options: ["Alpha", "Beta"],
-            allowFreeform: true,
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 12 } },
-                     createTheme(),
-                     createKeybindings(),
-                     () => { },
-                  );
-                  // Render once so the prompt pane computes a scrollable overflow.
-                  component.render(50);
-                  // Enter freeform mode (last option is the freeform sentinel).
-                  component.handleInput("down");
-                  component.handleInput("down");
-                  component.handleInput("enter");
-                  component.render(50);
-                  // These must reach the editor, not the prompt-scroll intercept.
-                  component.handleInput("pageUp");
-                  component.handleInput("pageDown");
-                  return null;
-               },
-            },
-         },
-      );
-
-      expect(result.isError).not.toBe(true);
-      expect(editorInputs).toContain("pageUp");
-      expect(editorInputs).toContain("pageDown");
-   });
-
-   test("does not apply overlay viewport clipping in inline mode", async () => {
-      const tool = await setupTool();
-      let rendered: string[] = [];
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "This is a very long question. ".repeat(80),
-            context: "Context detail. ".repeat(80),
-            options: ["Alpha", "Beta"],
-            displayMode: "inline",
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 12 } },
-                     createTheme(),
-                     createKeybindings(),
-                     () => { },
-                  );
-                  rendered = component.render(50);
-                  return null;
-               },
-            },
-         },
-      );
-
-      expect(result.isError).not.toBe(true);
-      expect(rendered.length).toBeGreaterThan(10);
-   });
-
-   test("collapses oversized context in inline mode but leaves short context expanded", async () => {
-      const tool = await setupTool();
-      const render = async (context: string) => {
-         let output = "";
-         await tool.execute(
-            "tool-call-id",
-            { question: "Pick one", context, options: ["Alpha", "Beta"], displayMode: "inline" },
-            undefined,
-            undefined,
-            {
-               hasUI: true,
-               ui: {
-                  custom: async (factory: any) => {
-                     const component = factory(
-                        { requestRender() { }, terminal: { rows: 12 } },
-                        createTheme(),
-                        createKeybindings(),
-                        () => { },
-                     );
-                     output = component.render(40).join("\n");
-                     return null;
-                  },
-               },
-            },
-         );
-         return output;
-      };
-
-      const shortOutput = await render("Short context.");
-      const longOutput = await render("Long context detail. ".repeat(80));
-      expect(shortOutput).toContain("Short context.");
-      expect(shortOutput).not.toContain("Context (");
-      expect(longOutput).toContain("Context (");
-      expect(longOutput).not.toContain("Long context detail.");
-   });
-
-   test("keeps medium inline context expanded until the user collapses it", async () => {
-      const tool = await setupTool();
-      let firstExpanded = "";
-      let secondExpanded = "";
-      let collapsedAgain = "";
-
-      await tool.execute(
-         "tool-call-id",
-         {
-            question: "Pick one",
-            context: Array.from({ length: 6 }, (_, index) => `Medium context line ${index}`).join("\n"),
-            options: ["Alpha", "Beta"],
-            displayMode: "inline",
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 24 } },
-                     createTheme(),
-                     createKeybindings(),
-                     () => { },
-                  );
-                  component.render(60);
-                  component.handleInput("ctrl+e");
-                  firstExpanded = component.render(60).join("\n");
-                  secondExpanded = component.render(60).join("\n");
-                  component.handleInput("ctrl+e");
-                  collapsedAgain = component.render(60).join("\n");
-                  return null;
-               },
-            },
-         },
-      );
-
-      expect(firstExpanded).toContain("Medium context line 5");
-      expect(secondExpanded).toContain("Medium context line 5");
-      expect(collapsedAgain).toContain("Context (");
-      expect(collapsedAgain).not.toContain("Medium context line 5");
-   });
-
-   test("bounds and scrolls expanded context in inline mode", async () => {
-      const tool = await setupTool();
-      let expanded: string[] = [];
-      let scrolled: string[] = [];
-
-      await tool.execute(
-         "tool-call-id",
-         {
-            question: "Pick one",
-            context: Array.from({ length: 20 }, (_, index) => `Inline context line ${index}`).join("\n"),
-            options: ["Alpha", "Beta"],
-            displayMode: "inline",
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 12 } },
-                     createTheme(),
-                     createKeybindings(),
-                     () => { },
-                  );
-                  component.render(50);
-                  component.handleInput("ctrl+e");
-                  expanded = component.render(50);
-                  component.handleInput("end");
-                  scrolled = component.render(50);
-                  return null;
-               },
-            },
-         },
-      );
-
-      expect(expanded.length).toBeLessThanOrEqual(10);
-      expect(expanded.join("\n")).toContain("Alpha");
-      expect(scrolled.join("\n")).toContain("Inline context line 19");
-      expect(scrolled.join("\n")).toContain("Alpha");
-      expect(scrolled.join("\n")).toContain("PgUp/P");
-   });
-
-   test("moves the context toggle when a configured shortcut owns ctrl+e", async () => {
-      const tool = await setupTool();
-      let help = "";
-      let commentEnabled = false;
-      let expanded = "";
-
-      await tool.execute(
-         "tool-call-id",
-         {
-            question: "Pick one",
-            context: "Long context detail. ".repeat(80),
-            options: ["Alpha", "Beta"],
-            allowComment: true,
-            commentToggleKey: "ctrl+e",
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 12 } },
-                     createTheme(),
-                     createKeybindings(),
-                     () => { },
-                  );
-                  component.render(50);
-                  help = (component as any).helpText.render(120).join("\n");
-                  component.handleInput("ctrl+e");
-                  commentEnabled = (component as any).singleSelectList.isCommentEnabled();
-                  component.handleInput("ctrl+x");
-                  component.render(50);
-                  component.handleInput("end");
-                  expanded = component.render(50).join("\n");
-                  return null;
-               },
-            },
-         },
-      );
-
-      expect(help).toContain("ctrl+e toggle context");
-      expect(help).toContain("ctrl+x expand context");
-      expect(commentEnabled).toBe(true);
-      expect(expanded).toContain("Long context detail.");
-   });
-
-   test("moves the context toggle when the overlay shortcut owns ctrl+e", async () => {
-      const tool = await setupTool();
-      let help = "";
-      let expanded = "";
-
-      await tool.execute(
-         "tool-call-id",
-         {
-            question: "Pick one",
-            context: "Long context detail. ".repeat(80),
-            options: ["Alpha", "Beta"],
-            overlayToggleKey: "ctrl+e",
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 12 } },
-                     createTheme(),
-                     createKeybindings(),
-                     () => { },
-                  );
-                  component.render(50);
-                  help = (component as any).helpText.render(120).join("\n");
-                  component.handleInput("ctrl+x");
-                  component.render(50);
-                  component.handleInput("end");
-                  expanded = component.render(50).join("\n");
-                  return null;
-               },
-            },
-         },
-      );
-
-      expect(help).toContain("ctrl+x expand context");
-      expect(expanded).toContain("Long context detail.");
-   });
-
-   test("submits immediately when the comment toggle is off", async () => {
-      const tool = await setupTool();
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["Alpha", "Beta"],
-            allowComment: true,
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  let resolved: any;
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 24 } },
-                     createTheme(),
-                     createKeybindings(),
-                     (value: any) => {
-                        resolved = value;
-                     },
-                  );
-
-                  component.handleInput("enter");
-                  return resolved ?? null;
-               },
-            },
-         },
-      );
-
-      expect(result.isError).not.toBe(true);
-      expect(result.details.response).toEqual({ kind: "selection", selections: ["Alpha"] });
-      expect(result.details.cancelled).toBe(false);
-   });
-
-   test("toggles extra context with the ctrl+g key and shows it in help text", async () => {
-      const tool = await setupTool();
-      let renderedBefore = "";
-      let renderedAfter = "";
-      let helpText = "";
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["Alpha", "Beta"],
-            allowComment: true,
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 24 } },
-                     createTheme(),
-                     createKeybindings(),
-                     () => { },
-                  );
-
-                  renderedBefore = ((component as any).singleSelectList as any).render(80).join("\n");
-                  helpText = (component as any).helpText.render().join("\n");
-                  component.handleInput("ctrl+g");
-                  renderedAfter = ((component as any).singleSelectList as any).render(80).join("\n");
-                  return null;
-               },
-            },
-         },
-      );
-
-      expect(result.isError).not.toBe(true);
-      expect(renderedBefore).toContain("[ ] Add extra context after selection");
-      expect(renderedAfter).toContain("[✓] Add extra context after selection");
-      expect(helpText).toContain("ctrl+g toggle context");
-   });
-
-   test("uses custom commentToggleKey for comment toggling and help text", async () => {
-      const tool = await setupTool();
-      let renderedBefore = "";
-      let renderedAfterIgnored = "";
-      let renderedAfterCustom = "";
-      let helpText = "";
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["Alpha", "Beta"],
-            allowComment: true,
-            commentToggleKey: "alt+c",
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 24 } },
-                     createTheme(),
-                     createKeybindings(),
-                     () => { },
-                  );
-
-                  renderedBefore = ((component as any).singleSelectList as any).render(80).join("\n");
-                  helpText = (component as any).helpText.render().join("\n");
-                  // Default ctrl+g should no longer toggle.
-                  component.handleInput("ctrl+g");
-                  renderedAfterIgnored = ((component as any).singleSelectList as any).render(80).join("\n");
-                  // Configured alt+c should toggle.
-                  component.handleInput("alt+c");
-                  renderedAfterCustom = ((component as any).singleSelectList as any).render(80).join("\n");
-                  return null;
-               },
-            },
-         },
-      );
-
-      expect(result.isError).not.toBe(true);
-      expect(renderedBefore).toContain("[ ] Add extra context after selection");
-      expect(renderedAfterIgnored).toContain("[ ] Add extra context after selection");
-      expect(renderedAfterCustom).toContain("[✓] Add extra context after selection");
-      expect(helpText).toContain("alt+c toggle context");
-      expect(helpText).not.toContain("ctrl+g toggle context");
-   });
-
-   test("commentToggleKey 'off' hides the toggle hint and ignores ctrl+g", async () => {
-      const tool = await setupTool();
-      let renderedBefore = "";
-      let renderedAfter = "";
-      let helpText = "";
-
-      await tool.execute(
-         "tool-call-id",
-         {
-            question: "Q",
-            options: ["Alpha", "Beta"],
-            allowComment: true,
-            commentToggleKey: "off",
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 24 } },
-                     createTheme(),
-                     createKeybindings(),
-                     () => { },
-                  );
-                  renderedBefore = ((component as any).singleSelectList as any).render(80).join("\n");
-                  helpText = (component as any).helpText.render().join("\n");
-                  component.handleInput("ctrl+g");
-                  renderedAfter = ((component as any).singleSelectList as any).render(80).join("\n");
-                  return null;
-               },
-            },
-         },
-      );
-
-      expect(renderedBefore).toContain("[ ] Add extra context after selection");
-      expect(renderedAfter).toContain("[ ] Add extra context after selection");
-      expect(helpText).not.toContain("toggle context");
-   });
-
-
-   test("collects an optional comment after a single selection before resolving", async () => {
-      const tool = await setupTool();
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which option should we use?",
-            options: ["Alpha", "Beta"],
-            allowComment: true,
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  let resolved: any;
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 24 } },
-                     createTheme(),
-                     createKeybindings(),
-                     (value: any) => {
-                        resolved = value;
-                     },
-                  );
-
-                  component.handleInput("ctrl+g");
-                  component.handleInput("enter");
-                  expect(resolved).toBeUndefined();
-                  editorText = "Needs audit logging before rollout.";
-                  component.handleInput("enter");
-                  return resolved ?? null;
-               },
-            },
-         },
-      );
-
-      expect(result.isError).not.toBe(true);
-      expect(result.details.response).toEqual({
-         kind: "selection",
-         selections: ["Alpha"],
-         comment: "Needs audit logging before rollout.",
-      });
-      expect(result.details.cancelled).toBe(false);
-   });
-
-   test("collects an optional comment for multi-select answers", async () => {
-      const tool = await setupTool();
-
-      const result = await tool.execute(
-         "tool-call-id",
-         {
-            question: "Which options should we use?",
-            options: ["Alpha", "Beta", "Gamma"],
-            allowMultiple: true,
-            allowComment: true,
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  let resolved: any;
-                  const component = factory(
-                     { requestRender() { }, terminal: { rows: 24 } },
-                     createTheme(),
-                     createKeybindings(),
-                     (value: any) => {
-                        resolved = value;
-                     },
-                  );
-
-                  component.handleInput("space");
-                  component.handleInput("down");
-                  component.handleInput("down");
-                  component.handleInput("space");
-                  component.handleInput("ctrl+g");
-                  component.handleInput("enter");
-                  expect(resolved).toBeUndefined();
-                  editorText = "Roll out both behind the same flag.";
-                  component.handleInput("enter");
-                  return resolved ?? null;
-               },
-            },
-         },
-      );
-
-      expect(result.isError).not.toBe(true);
-      expect(result.details.response).toEqual({
-         kind: "selection",
-         selections: ["Alpha", "Gamma"],
-         comment: "Roll out both behind the same flag.",
-      });
-      expect(result.details.cancelled).toBe(false);
-   });
-
-
-   test("does not crash when host theme singleton is uninitialised (regression for #17)", async () => {
-      // The shared `getMarkdownTheme` mock above returns a bag of closures
-      // that throw on every property read of the underlying theme proxy,
-      // mirroring what happens on pre-rename hosts where our bundled copy of
-      // pi-coding-agent has its own (uninitialised) `globalThis` slot. The
-      // `Markdown` mock above also calls `theme.bold` during render. So if
-      // the extension ever stops gating through `safeMarkdownTheme()`, the
-      // throw surfaces at one of the two callsites: the constructor's
-      // context branch, or the split-pane preview built by
-      // `buildPreviewLines` — both must remain quiet.
-      const tool = await setupTool();
-      let constructionError: unknown;
-      let previewError: unknown;
-      let preview = "";
-
-      await tool.execute(
-         "tool-call-id",
-         {
-            question: "Pick one",
-            context: "Some **markdown** context",
-            options: [
-               { title: "Alpha", description: "First **emphasised** option" },
-               { title: "Beta", description: "Second option" },
-            ],
-         },
-         undefined,
-         undefined,
-         {
-            hasUI: true,
-            ui: {
-               custom: async (factory: any) => {
-                  let component: any;
-                  try {
-                     component = factory(
-                        { requestRender() { }, terminal: { rows: 24 } },
-                        createTheme(),
-                        createKeybindings(),
-                        () => { },
-                     );
-                  } catch (err) {
-                     constructionError = err;
-                     return null;
-                  }
-                  try {
-                     // Width 120 forces the split-pane preview, which is the
-                     // path that constructs and renders the Markdown
-                     // component over the option description.
-                     preview = (component.singleSelectList as any).render(120).join("\n");
-                  } catch (err) {
-                     previewError = err;
-                  }
-                  return null;
-               },
-            },
-         },
-      );
-
-      expect(constructionError).toBeUndefined();
-      expect(previewError).toBeUndefined();
-      // Confirm the raw markdown fell through to plain Text rendering rather
-      // than getting silently dropped when the theme proxy was unavailable.
-      expect(preview).toContain("## Alpha");
-      expect(preview).toContain("First **emphasised** option");
-   });
-
-
-
-   describe("issue #22 option normalization", () => {
-      test("salvages common option title aliases when schema proxies mangle the shape", async () => {
-         const tool = await setupTool();
-         let selectOptions: string[] = [];
-
-         const result = await tool.execute(
-            "tool-call-id",
-            {
-               question: "Pick one",
-               options: [
-                  { label: "A" },
-                  { text: "B" },
-                  { value: "C" },
-                  { name: "D" },
-                  { option: "E" },
-               ],
-               allowFreeform: false,
-            },
-            undefined,
-            undefined,
-            {
-               hasUI: true,
-               ui: {
-                  custom: async () => undefined,
-                  select: async (_title: string, opts: string[]) => {
-                     selectOptions = opts;
-                     return "C";
-                  },
-                  input: async () => undefined,
-               },
-            },
-         );
-
-         expect(selectOptions).toEqual(["A", "B", "C", "D", "E"]);
-         expect(result.details.response).toEqual({ kind: "selection", selections: ["C"] });
-         expect(result.details.options.map((option: { title: string }) => option.title)).toEqual(["A", "B", "C", "D", "E"]);
-      });
-
-      test("filters blank labels, coerces primitive options, and keeps only non-blank descriptions", async () => {
-         const tool = await setupTool();
-         let selectOptions: string[] = [];
-
-         const result = await tool.execute(
-            "tool-call-id",
-            {
-               question: "Pick one",
-               options: [
-                  "  ",
-                  "",
-                  42,
-                  true,
-                  "Real",
-                  { title: "A", description: "  " },
-                  { label: "B", description: "why" },
-               ],
-               allowFreeform: false,
-            },
-            undefined,
-            undefined,
-            {
-               hasUI: true,
-               ui: {
-                  custom: async () => undefined,
-                  select: async (_title: string, opts: string[]) => {
-                     selectOptions = opts;
-                     return "B";
-                  },
-                  input: async () => undefined,
-               },
-            },
-         );
-
-         expect(selectOptions).toEqual(["42", "true", "Real", "A", "B"]);
-         expect(result.details.options).toEqual([
-            { title: "42" },
-            { title: "true" },
-            { title: "Real" },
-            { title: "A" },
-            { title: "B", description: "why" },
-         ]);
-      });
-
-      test("throws instead of opening UI when every supplied option is malformed", async () => {
-         const tool = await setupTool();
-         let calls = 0;
-
-         const error = await rejectedError(tool.execute(
-            "tool-call-id",
-            {
-               question: "Pick one",
-               options: [{}, { foo: "x" }, "   "],
-            },
-            undefined,
-            undefined,
-            {
-               hasUI: true,
-               ui: {
-                  custom: async () => {
-                     calls += 1;
-                     return undefined;
-                  },
-                  select: async () => {
-                     calls += 1;
-                     return undefined;
-                  },
-                  input: async () => {
-                     calls += 1;
-                     return undefined;
-                  },
-               },
-            },
-         ));
-
-         expect(error.message).toContain("option(s) were malformed");
-         expect(error.message).toContain("{ \"title\": \"Short label\", \"description\": \"Optional detail\" }");
-         expect(calls).toBe(0);
-      });
-   });
-
-   describe("issue #38 typebox shim compatibility", () => {
-      // Fakes stand in for the real builders; their signatures are narrower than
-      // TypeBox's generics, so the cast is the only way to hand them to StringEnum.
-      const realTypeBoxLike = {
-         Unsafe: (schema: Record<string, unknown>) => ({ ...schema }),
-         Optional: (schema: unknown) => schema,
-         Union: () => {
-            throw new Error("union path must not run on real TypeBox");
-         },
-         Literal: (value: unknown) => value,
-      } as unknown as StringEnumBuilder;
-
-      type RuntimeSchema = {
-         runtime: true;
-         members: unknown[];
-         meta: Record<string, unknown>;
-         or: () => RuntimeSchema;
-         describe: (text: string) => RuntimeSchema;
-         default: (value: unknown) => RuntimeSchema;
-      };
-      const runtimeSchema = (members: unknown[], meta: Record<string, unknown> = {}): RuntimeSchema => ({
-         runtime: true,
-         members,
-         meta,
-         or: () => runtimeSchema(members, meta),
-         describe: (text) => runtimeSchema(members, { ...meta, description: text }),
-         default: (value) => runtimeSchema(members, { ...meta, default: value }),
-      });
-      const isRuntimeSchema = (value: unknown): value is RuntimeSchema =>
-         typeof value === "object" && value !== null && "or" in value && typeof value.or === "function";
-      // Mirrors oh-my-pi's legacy-typebox shim: Unsafe yields a plain object,
-      // Optional evaluates `asRuntime(schema).or(...)`, Union ignores options.
-      const ompOptional = (schema: unknown) => {
-         if (!isRuntimeSchema(schema)) throw new TypeError("asRuntime(schema).or is not a function");
-         return schema.or();
-      };
-      const ompLike = {
-         Unsafe: (schema: Record<string, unknown>) => ({ ...schema }),
-         Optional: ompOptional,
-         Union: (members: unknown[]) => runtimeSchema(members),
-         Literal: (value: unknown) => ({ literal: value }),
-      } as unknown as StringEnumBuilder;
-
-      test("emits the flat enum on hosts whose Type.Optional accepts Type.Unsafe", async () => {
-         const { StringEnum } = await import("./index");
-         const schema: unknown = StringEnum(["overlay", "inline"] as const, { description: "mode", default: "overlay" }, realTypeBoxLike);
-         expect(schema).toEqual({ type: "string", enum: ["overlay", "inline"], description: "mode", default: "overlay" });
-      });
-
-      test("falls back to a literal union that Type.Optional can wrap on omp-style shims", async () => {
-         const { StringEnum } = await import("./index");
-         const schema: unknown = StringEnum(["overlay", "inline"] as const, { description: "mode" }, ompLike);
-         if (!isRuntimeSchema(schema)) throw new Error("expected a runtime union schema");
-         expect(schema.members).toEqual([{ literal: "overlay" }, { literal: "inline" }]);
-         expect(schema.meta).toEqual({ description: "mode" });
-         expect(() => ompOptional(schema)).not.toThrow();
-      });
-   });
-
-   describe("RPC fallback (custom() returns undefined)", () => {
-      test("single-select falls back to ctx.ui.select()", async () => {
-         const tool = await setupTool();
-         let selectTitle = "";
-         let selectOptions: string[] = [];
-
-         const result = await tool.execute(
-            "tool-call-id",
-            {
-               question: "Pick a color",
-               options: ["Red", "Blue"],
-               allowFreeform: false,
-            },
-            undefined,
-            undefined,
-            {
-               hasUI: true,
-               ui: {
-                  custom: async () => undefined,
-                  select: async (title: string, opts: string[]) => {
-                     selectTitle = title;
-                     selectOptions = opts;
-                     return "Blue";
-                  },
-                  input: async () => undefined,
-               },
-            },
-         );
-
-         expect(result.isError).not.toBe(true);
-         expect(result.details.response).toEqual({ kind: "selection", selections: ["Blue"] });
-         expect(result.details.cancelled).toBe(false);
-         expect(selectTitle).toContain("Pick a color");
-         expect(selectOptions).toEqual(["Red", "Blue"]);
-      });
-
-      test("single-select with freeform appends sentinel option", async () => {
-         const tool = await setupTool();
-         let selectOptions: string[] = [];
-
-         const result = await tool.execute(
-            "tool-call-id",
-            {
-               question: "Pick a color",
-               options: ["Red", "Blue"],
-               allowFreeform: true,
-            },
-            undefined,
-            undefined,
-            {
-               hasUI: true,
-               ui: {
-                  custom: async () => undefined,
-                  select: async (_title: string, opts: string[]) => {
-                     selectOptions = opts;
-                     return "Red";
-                  },
-                  input: async () => undefined,
-               },
-            },
-         );
-
-         expect(result.isError).not.toBe(true);
-         expect(result.details.response).toEqual({ kind: "selection", selections: ["Red"] });
-         // Last option should be the freeform sentinel
-         expect(selectOptions).toHaveLength(3);
-         expect(selectOptions[2]).toContain("Type custom response");
-      });
-
-      test("selecting freeform sentinel follows up with input()", async () => {
-         const tool = await setupTool();
-         let inputCalled = false;
-         const sentinel = "\u270f\ufe0f Type custom response...";
-
-         const result = await tool.execute(
-            "tool-call-id",
-            {
-               question: "Pick a color",
-               options: ["Red", "Blue"],
-               allowFreeform: true,
-            },
-            undefined,
-            undefined,
-            {
-               hasUI: true,
-               ui: {
-                  custom: async () => undefined,
-                  select: async () => sentinel,
-                  input: async () => {
-                     inputCalled = true;
-                     return "Purple";
-                  },
-               },
-            },
-         );
-
-         expect(result.isError).not.toBe(true);
-         expect(inputCalled).toBe(true);
-         expect(result.details.response).toEqual({ kind: "freeform", text: "Purple" });
-      });
-
-      test("multi-select degrades to input() with options in prompt", async () => {
-         const tool = await setupTool();
-         let inputTitle = "";
-
-         const result = await tool.execute(
-            "tool-call-id",
-            {
-               question: "Pick colors",
-               options: ["Red", "Blue", "Green"],
-               allowMultiple: true,
-            },
-            undefined,
-            undefined,
-            {
-               hasUI: true,
-               ui: {
-                  custom: async () => undefined,
-                  select: async () => undefined,
-                  input: async (title: string) => {
-                     inputTitle = title;
-                     return "Red, Green";
-                  },
-               },
-            },
-         );
-
-         expect(result.isError).not.toBe(true);
-         expect(result.details.response).toEqual({ kind: "selection", selections: ["Red", "Green"] });
-         // Prompt should list the options for the user
-         expect(inputTitle).toContain("1. Red");
-         expect(inputTitle).toContain("2. Blue");
-         expect(inputTitle).toContain("3. Green");
-      });
-
-      test("single-select can collect an optional comment after choosing an option", async () => {
-         const tool = await setupTool();
-         let inputCalls = 0;
-
-         const result = await tool.execute(
-            "tool-call-id",
-            {
-               question: "Pick a color",
-               options: ["Red", "Blue"],
-               allowComment: true,
-            },
-            undefined,
-            undefined,
-            {
-               hasUI: true,
-               ui: {
-                  custom: async () => undefined,
-                  select: async () => "Blue",
-                  input: async () => {
-                     inputCalls += 1;
-                     return "Keep it aligned with the settings screen.";
-                  },
-               },
-            },
-         );
-
-         expect(inputCalls).toBe(1);
-         expect(result.isError).not.toBe(true);
-         expect(result.details.response).toEqual({
-            kind: "selection",
-            selections: ["Blue"],
-            comment: "Keep it aligned with the settings screen.",
-         });
-         expect(result.details.cancelled).toBe(false);
-      });
-
-
-      test("returns cancelled when select() returns undefined", async () => {
-         const tool = await setupTool();
-
-         const result = await tool.execute(
-            "tool-call-id",
-            {
-               question: "Pick a color",
-               options: ["Red", "Blue"],
-            },
-            undefined,
-            undefined,
-            {
-               hasUI: true,
-               ui: {
-                  custom: async () => undefined,
-                  select: async () => undefined,
-                  input: async () => undefined,
-               },
-            },
-         );
-
-         expect(result.details.cancelled).toBe(true);
-         expect(result.details.response).toBeNull();
-      });
-
-      test("passes context into the dialog prompt", async () => {
-         const tool = await setupTool();
-         let selectTitle = "";
-
-         await tool.execute(
-            "tool-call-id",
-            {
-               question: "Pick a color",
-               context: "The sky is blue today.",
-               options: ["Red", "Blue"],
-               allowFreeform: false,
-            },
-            undefined,
-            undefined,
-            {
-               hasUI: true,
-               ui: {
-                  custom: async () => undefined,
-                  select: async (title: string) => {
-                     selectTitle = title;
-                     return "Blue";
-                  },
-                  input: async () => undefined,
-               },
-            },
-         );
-
-         expect(selectTitle).toContain("Pick a color");
-         expect(selectTitle).toContain("The sky is blue today.");
-      });
-
-      test("passes timeout to dialog methods", async () => {
-         const tool = await setupTool();
-         let capturedOpts: any;
-
-         await tool.execute(
-            "tool-call-id",
-            {
-               question: "Pick a color",
-               options: ["Red", "Blue"],
-               allowFreeform: false,
-               timeout: 5000,
-            },
-            undefined,
-            undefined,
-            {
-               hasUI: true,
-               ui: {
-                  custom: async () => undefined,
-                  select: async (_title: string, _opts: string[], opts: any) => {
-                     capturedOpts = opts;
-                     return "Red";
-                  },
-                  input: async () => undefined,
-               },
-            },
-         );
-
-         expect(capturedOpts).toEqual({ timeout: 5000 });
-      });
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", oneQuestion(), undefined, undefined, { hasUI: true, ui });
+      press(state.component, "enter");
+      await execution;
+      expect(emittedEvents.some((event) => event.name.startsWith("ask:"))).toBe(false);
    });
 });
 
-describe("cancellation correctness", () => {
-   const stages = [
-      { name: "no-options input", params: { options: [] }, stage: "input", value: "late answer" },
-      { name: "RPC select", params: {}, stage: "select", value: "A" },
-      { name: "RPC multi-input", params: { allowMultiple: true }, stage: "input", value: "A" },
-      { name: "RPC freeform input", params: {}, stage: "input", value: "late answer", freeform: true },
-      { name: "RPC single comment", params: { allowComment: true }, stage: "input", value: "late comment" },
-      { name: "RPC multi comment", params: { allowMultiple: true, allowComment: true }, stage: "comment", value: "late comment" },
-   ];
+// ==========================================================================
+// Input validation
+// ==========================================================================
 
-   for (const stage of stages) {
-      for (const honorsSignal of [true, false]) {
-         test(`${stage.name}: abort cancels ${honorsSignal ? "pending" : "late"} response without another dialog`, async () => {
-            const tool = await setupTool();
-            const controller = new AbortController();
-            let opened!: () => void;
-            const pending = new Promise<void>((resolve) => { opened = resolve; });
-            let finish!: (value: string | undefined) => void;
-            let dialogOpts: any;
-            let dismissed = false;
-            let calls = 0;
-            let inputCalls = 0;
-            const waitForAnswer = (opts: any) => {
-               dialogOpts = opts;
-               opened();
-               return new Promise<string | undefined>((resolve) => {
-                  finish = resolve;
-                  if (honorsSignal) opts?.signal?.addEventListener("abort", () => {
-                     dismissed = true;
-                     resolve(undefined);
-                  }, { once: true });
-               });
-            };
-            const execution = tool.execute(
-               "id",
-               { question: "Pick", context: "private context", options: ["A"], timeout: 5000, ...stage.params },
-               controller.signal,
-               undefined,
-               { hasUI: true, ui: {
-                  custom: async () => undefined,
-                  select: async (_title: string, options: string[], opts: any) => {
-                     calls++;
-                     if (stage.stage === "select") return waitForAnswer(opts);
-                     return stage.freeform ? options[options.length - 1] : "A";
-                  },
-                  input: async (_title: string, _placeholder: string, opts: any) => {
-                     calls++;
-                     inputCalls++;
-                     if (stage.stage === "comment" && inputCalls === 1) return "A";
-                     return waitForAnswer(opts);
-                  },
-               } },
-            );
-            await pending;
-            const callsBeforeAbort = calls;
-            controller.abort();
-            // Release a host which ignores the signal too, so regressions fail without hanging.
-            finish(stage.value);
-            const result = await execution;
-            expect(dialogOpts).toEqual({ signal: controller.signal, timeout: 5000 });
-            expect(dismissed).toBe(honorsSignal);
-            expect(result.details.cancelled).toBe(true);
-            expect(result.details.response).toBeNull();
-            expect(calls).toBe(callsBeforeAbort);
-            expect(emittedEvents.filter((event) => event.name.startsWith("ask:"))).toEqual([
-               { name: "ask:cancelled", payload: { question: "Pick" } },
-            ]);
-         });
-      }
+describe("ask_user_question validation", () => {
+   async function rejects(params: any, message: string) {
+      const tool = await setupTool();
+      let opened = 0;
+      const open = async () => { opened++; return undefined; };
+      const error = await rejectedError(tool.execute("id", params, undefined, undefined, {
+         hasUI: true,
+         ui: { custom: open, select: open, input: open },
+      }));
+      expect(error.message).toContain(message);
+      expect(opened).toBe(0);
+      return error;
    }
 
-   for (const allowMultiple of [false, true]) {
-      for (const comment of [undefined, null, "", "   "]) {
-         test(`RPC ${allowMultiple ? "multi" : "single"} comment distinguishes ${JSON.stringify(comment)} from cancellation`, async () => {
-            const tool = await setupTool();
-            let inputs = 0;
-            const result = await tool.execute(
-               "id", { question: "Pick", options: ["A"], allowMultiple, allowComment: true },
-               undefined, undefined,
-               { hasUI: true, ui: {
-                  custom: async () => undefined,
-                  select: async () => "A",
-                  input: async () => allowMultiple && inputs++ === 0 ? "A" : comment,
-               } },
-            );
-            const cancelled = comment == null;
-            expect(result.details.cancelled).toBe(cancelled);
-            expect(result.details.response).toEqual(cancelled ? null : { kind: "selection", selections: ["A"] });
-            expect(emittedEvents.filter((event) => event.name.startsWith("ask:")).map((event) => event.name))
-               .toEqual([cancelled ? "ask:cancelled" : "ask:answered"]);
-         });
-      }
+   test("requires a questions array", () => rejects({}, "questions must be an array"));
+   test("rejects an empty questions array", () => rejects({ questions: [] }, "needs 1-4 entries"));
+   test("rejects five questions", () => rejects(batch(["A?", "B?", "C?", "D?", "E?"].map((q) => ({ question: q }))), "at most 4"));
+   test("rejects a non-array questions value", () => rejects({ questions: "First?" }, "must be an array"));
+   test("rejects a blank question", () => rejects({ questions: [entry("  ")] }, "question must be a non-empty string"));
+   test("rejects duplicate question text", () => rejects(batch([{ question: "Same?" }, { question: "Same?" }]), "repeats the question"));
+   test("rejects a blank header", () => rejects({ questions: [{ question: "Q?", header: "  ", options: opts2() }] }, "header must be a non-empty string"));
+   test("rejects a missing header", () => rejects({ questions: [{ question: "Q?", options: opts2() }] }, "header must be a non-empty string"));
+   test("rejects fewer than two options", () => rejects({ questions: [{ question: "Q?", header: "h", options: [opt("Only")] }] }, "needs 2-4 entries"));
+   test("rejects more than four options", () => rejects(
+      { questions: [{ question: "Q?", header: "h", options: [opt("A"), opt("B"), opt("C"), opt("D"), opt("E")] }] },
+      "needs 2-4 entries",
+   ));
+   test("rejects a non-array options value", () => rejects({ questions: [{ question: "Q?", header: "h", options: "Alpha" }] }, "must be an array"));
+   test("rejects an option without a label", () => rejects(
+      { questions: [{ question: "Q?", header: "h", options: [{ description: "no label" }, opt("B")] }] },
+      "options[0] must be an object",
+   ));
+   test("rejects an option without a description", () => rejects(
+      { questions: [{ question: "Q?", header: "h", options: [{ label: "A" }, opt("B")] }] },
+      "options[0] must be an object",
+   ));
+   test("rejects duplicate labels within a question", () => rejects(
+      { questions: [{ question: "Q?", header: "h", options: [opt("Yes"), opt("Yes", "other")] }] },
+      'repeats the label "Yes"',
+   ));
+   test("accepts four options", async () => {
+      const tool = await setupTool();
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", { questions: [entry("Q?", [opt("A"), opt("B"), opt("C"), opt("D")])] }, undefined, undefined, { hasUI: true, ui });
+      press(state.component, "enter");
+      const result = await execution;
+      expect(result.details.answers).toEqual([{ question: "Q?", kind: "option", answer: "A" }]);
+   });
+
+   for (const reserved of ["Other", "Type something.", "Next"]) {
+      test(`rejects the reserved label ${JSON.stringify(reserved)}`, () => rejects(
+         { questions: [{ question: "Q?", header: "h", options: [opt(reserved), opt("Keep")] }] },
+         `reserved label "${reserved}"`,
+      ));
    }
 
-   for (const params of [{ allowComment: true }, { allowFreeform: true }, { allowMultiple: true, allowComment: true }]) {
-      test(`abort after first RPC answer prevents follow-up ${JSON.stringify(params)}`, async () => {
-         const tool = await setupTool();
-         const controller = new AbortController();
-         let calls = 0;
-         const result = await tool.execute(
-            "id", { question: "Pick", options: ["A"], ...params }, controller.signal, undefined,
-            { hasUI: true, ui: {
-               custom: async () => undefined,
-               select: async (_title: string, options: string[]) => {
-                  calls++;
-                  controller.abort();
-                  return params.allowFreeform ? options[options.length - 1] : "A";
-               },
-               input: async () => { calls++; controller.abort(); return "A"; },
-            } },
-         );
-         expect(calls).toBe(1);
-         expect(result.details.cancelled).toBe(true);
+   for (const field of ["question", "header", "options", "multiSelect"]) {
+      test(`rejects ${field} at the top level`, () => rejects(
+         { questions: [entry("Continue?")], [field]: null },
+         `${field} cannot be set at the top level`,
+      ));
+   }
+
+   for (const key of ASK_USER_SETTING_KEYS) {
+      test(`rejects the setting ${key} as a tool parameter`, () => rejects(
+         { questions: [entry("Continue?")], [key]: null },
+         `${key} are configuration settings`,
+      ));
+   }
+
+   test("validation runs even when the signal is already aborted", async () => {
+      const tool = await setupTool();
+      const controller = new AbortController();
+      controller.abort();
+      const error = await rejectedError(tool.execute(
+         "id", { questions: [entry("Q?", [opt("Only")])] }, controller.signal, undefined,
+         { hasUI: true, ui: { custom: async () => undefined } },
+      ));
+      expect(error.message).toContain("needs 2-4 entries");
+   });
+
+   test("an already-aborted valid call cancels without opening UI", async () => {
+      const tool = await setupTool();
+      const controller = new AbortController();
+      controller.abort();
+      let opened = 0;
+      const result = await tool.execute("id", oneQuestion(), controller.signal, undefined, {
+         hasUI: true, ui: { custom: async () => { opened++; return undefined; } },
       });
+      expect(opened).toBe(0);
+      expect(result.details).toEqual({ answers: [], cancelled: true });
+   });
+});
+
+// ==========================================================================
+// Result rendering
+// ==========================================================================
+
+describe("ask_user_question result rendering", () => {
+   test("renders partial updates as a waiting state", async () => {
+      const tool = await setupTool();
+      const component = tool.renderResult(
+         { content: [{ type: "text", text: "Waiting for user input..." }], details: { answers: [], cancelled: false } },
+         { expanded: false, isPartial: true }, createTheme(),
+      );
+      expect(component.render(80).join("\n")).toContain("Waiting for user input...");
+   });
+
+   test("renders thrown failures as errors", async () => {
+      const tool = await setupTool();
+      const component = tool.renderResult(
+         { content: [{ type: "text", text: "boom" }], details: { error: "boom" } },
+         { expanded: false, isPartial: false }, createTheme(), { isError: true },
+      );
+      expect(component.render(80).join("\n")).toContain("boom");
+   });
+
+   test("renders a cancelled result", async () => {
+      const tool = await setupTool();
+      const component = tool.renderResult(
+         { content: [], details: { answers: [], cancelled: true } },
+         { expanded: false, isPartial: false }, createTheme(),
+      );
+      expect(component.render(80).join("\n")).toContain("Cancelled");
+   });
+
+   test("renders an option answer with its question", async () => {
+      const tool = await setupTool();
+      const component = tool.renderResult(
+         { content: [], details: { answers: [{ question: "Continue?", kind: "option", answer: "Yes" }], cancelled: false } },
+         { expanded: false, isPartial: false }, createTheme(),
+      );
+      const rendered = component.render(120).join("\n");
+      expect(rendered).toContain("1 answered");
+      expect(rendered).toContain("Continue?");
+      expect(rendered).toContain("Yes");
+   });
+
+   test("renders a multi answer from its selected labels", async () => {
+      const tool = await setupTool();
+      const component = tool.renderResult(
+         { content: [], details: { answers: [{ question: "Pick", kind: "multi", answer: null, selected: ["A", "C"] }], cancelled: false } },
+         { expanded: false, isPartial: false }, createTheme(),
+      );
+      expect(component.render(120).join("\n")).toContain("A, C");
+   });
+
+   test("renders a custom answer with a wrote marker", async () => {
+      const tool = await setupTool();
+      const component = tool.renderResult(
+         { content: [], details: { answers: [{ question: "Why?", kind: "custom", answer: "Because reasons" }], cancelled: false } },
+         { expanded: false, isPartial: false }, createTheme(),
+      );
+      const rendered = component.render(120).join("\n");
+      expect(rendered).toContain("(wrote)");
+      expect(rendered).toContain("Because reasons");
+   });
+
+   test("renderCall lists questions, headers and option counts", async () => {
+      const tool = await setupTool();
+      const component = tool.renderCall(
+         { questions: [entry("Continue?", opts2(), { header: "Release" }), entry("Also?", opts2("X", "Y"), { header: "Extra", multiSelect: true })] },
+         createTheme(),
+      );
+      const rendered = component.render(140).join("\n");
+      expect(rendered).toContain("2 questions");
+      expect(rendered).toContain("[Release]");
+      expect(rendered).toContain("2 option(s)");
+      expect(rendered).toContain("multi-select");
+   });
+});
+
+// ==========================================================================
+// Settings command
+// ==========================================================================
+
+describe("/ask-user-question-settings", () => {
+   function notifications() {
+      const messages: Array<{ message: string; type: string }> = [];
+      return { messages, notify(message: string, type: string) { messages.push({ message, type }); } };
    }
+
+   test("default runtime settings are inline, auto, standard shortcut and no timeout", async () => {
+      for (const key of ["PI_ASK_USER_DISPLAY_MODE", "PI_ASK_USER_SINGLE_SELECT_LAYOUT", "PI_ASK_USER_OVERLAY_TOGGLE_KEY"]) stubEnv(key, undefined);
+      const tool = await setupTool();
+      let captured: any;
+      let uiOptions: any;
+      await tool.execute("id", oneQuestion(), undefined, undefined, {
+         hasUI: true,
+         ui: {
+            custom: async (factory: any, options: any) => {
+               uiOptions = options;
+               captured = factory({ requestRender() { }, terminal: { rows: 24 } }, createTheme(), createKeybindings(), () => { }).settings;
+               return null;
+            },
+         },
+      });
+      expect(uiOptions).toBeUndefined();
+      expect(captured).toMatchObject({ displayMode: "inline", singleSelectLayout: "auto", timeout: 0 });
+      expect(captured.shortcuts.overlayToggle.spec).toBe("alt+o");
+      expect(existsSync(tool.settingsPath)).toBe(false);
+   });
+
+   test("command updates all four settings and persisted values beat environment preferences", async () => {
+      stubEnv("PI_ASK_USER_DISPLAY_MODE", "inline");
+      stubEnv("PI_ASK_USER_SINGLE_SELECT_LAYOUT", "list");
+      stubEnv("PI_ASK_USER_OVERLAY_TOGGLE_KEY", "alt+h");
+      const tool = await setupTool({ displayMode: "overlay", singleSelectLayout: "auto", overlayToggleKey: "off", timeout: 5000 });
+      expect(JSON.parse(readFileSync(tool.settingsPath, "utf8"))).toEqual({
+         displayMode: "overlay", singleSelectLayout: "auto", overlayToggleKey: "off", timeout: 5000,
+      });
+      let captured: any;
+      await tool.execute("id", oneQuestion(), undefined, undefined, {
+         hasUI: true,
+         ui: {
+            custom: async (factory: any, options: any) => {
+               expect(options.overlay).toBe(true);
+               captured = factory({ requestRender() { }, terminal: { rows: 24 } }, createTheme(), createKeybindings(), () => { }).settings;
+               return null;
+            },
+         },
+      });
+      expect(captured).toMatchObject({ displayMode: "overlay", singleSelectLayout: "auto", timeout: 5000 });
+      expect(captured.shortcuts.overlayToggle.disabled).toBe(true);
+   });
+
+   test("default removes a saved override and restores the environment preference", async () => {
+      stubEnv("PI_ASK_USER_DISPLAY_MODE", "overlay");
+      const tool = await setupTool({ displayMode: "inline", timeout: 0 });
+      const notices = notifications();
+      await tool.settingsCommand.handler("displayMode default", { hasUI: true, ui: notices });
+      expect(JSON.parse(readFileSync(tool.settingsPath, "utf8"))).toEqual({ timeout: 0 });
+      await tool.execute("id", oneQuestion(), undefined, undefined, {
+         hasUI: true, ui: { custom: async (_factory: any, options: any) => { expect(options.overlay).toBe(true); return null; } },
+      });
+      expect(notices.messages[0]?.type).toBe("info");
+   });
+
+   test("interactive menu edits values and saves before returning to the menu", async () => {
+      const tool = await setupTool();
+      const notices = notifications();
+      let selections = 0;
+      await tool.settingsCommand.handler("", {
+         hasUI: true,
+         ui: {
+            ...notices,
+            select: async (_title: string, options: string[]) => {
+               selections++;
+               if (selections === 1) return options.find((option) => option.startsWith("displayMode:"));
+               if (selections === 2) return "overlay";
+               expect(JSON.parse(readFileSync(tool.settingsPath, "utf8"))).toEqual({ displayMode: "overlay" });
+               expect(options.some((option) => option === "displayMode: overlay (saved)")).toBe(true);
+               return "Done";
+            },
+         },
+      });
+      expect(selections).toBe(3);
+   });
+
+   test("invalid command values preserve the configuration and report an error", async () => {
+      const tool = await setupTool({ timeout: 5000 });
+      const before = readFileSync(tool.settingsPath, "utf8");
+      const notices = notifications();
+      for (const args of ["timeout -1", "overlayToggleKey ++bad++", "displayMode fullscreen", "singleSelectLayout wide"]) {
+         await tool.settingsCommand.handler(args, { hasUI: true, ui: notices });
+      }
+      expect(notices.messages.map((notice) => notice.type)).toEqual(["error", "error", "error", "error"]);
+      expect(readFileSync(tool.settingsPath, "utf8")).toBe(before);
+   });
+
+   test("unknown keys and malformed command syntax do not write files", async () => {
+      const tool = await setupTool();
+      const notices = notifications();
+      for (const args of ["contextExpanded true", "allowComment true", "displayMode", "timeout 5000 extra"]) {
+         await tool.settingsCommand.handler(args, { hasUI: true, ui: notices });
+      }
+      expect(notices.messages.every((notice) => notice.type === "warning")).toBe(true);
+      expect(existsSync(tool.settingsPath)).toBe(false);
+   });
+
+   test("menu without UI does not write settings", async () => {
+      const tool = await setupTool();
+      const notices = notifications();
+      await tool.settingsCommand.handler("", { hasUI: false, ui: notices });
+      expect(notices.messages[0]?.type).toBe("warning");
+      expect(existsSync(tool.settingsPath)).toBe(false);
+   });
+
+   test("corrupt settings warn during execution but are never overwritten", async () => {
+      stubEnv("PI_ASK_USER_DISPLAY_MODE", "inline");
+      const tool = await setupTool();
+      writeFileSync(tool.settingsPath, "{broken");
+      const notices = notifications();
+      await tool.settingsCommand.handler("displayMode overlay", { hasUI: true, ui: notices });
+      expect(notices.messages[0]?.type).toBe("error");
+      await tool.execute("id", oneQuestion(), undefined, undefined, {
+         hasUI: true, ui: { ...notices, custom: async (_factory: any, options: any) => { expect(options).toBeUndefined(); return null; } },
+      });
+      expect(notices.messages.at(-1)?.type).toBe("warning");
+      expect(readFileSync(tool.settingsPath, "utf8")).toBe("{broken");
+   });
+
+   test("command updates leave shared Pi settings unchanged", async () => {
+      const tool = await setupTool();
+      const sharedPath = join(dirname(tool.settingsPath), "settings.json");
+      const shared = '{"model":"shared"}\n';
+      writeFileSync(sharedPath, shared);
+      await tool.settingsCommand.handler("displayMode overlay", { hasUI: true, ui: notifications() });
+      expect(readFileSync(sharedPath, "utf8")).toBe(shared);
+   });
+});
+
+// ==========================================================================
+// Display mode resolution
+// ==========================================================================
+
+describe("display mode resolution", () => {
+   async function captureOptions(tool: RegisteredTool) {
+      let uiOptions: any;
+      await tool.execute("id", oneQuestion(), undefined, undefined, {
+         hasUI: true, ui: { custom: async (_factory: any, options: any) => { uiOptions = options; return null; } },
+      });
+      return uiOptions;
+   }
+
+   test("inline mode passes no overlay options", async () => {
+      expect(await captureOptions(await setupTool({ displayMode: "inline" }))).toBeUndefined();
+   });
+
+   test("overlay mode passes centered overlay options", async () => {
+      const options = await captureOptions(await setupTool({ displayMode: "overlay" }));
+      expect(options.overlay).toBe(true);
+      expect(options.overlayOptions.anchor).toBe("center");
+   });
+
+   test("PI_ASK_USER_DISPLAY_MODE applies when no saved displayMode exists", async () => {
+      stubEnv("PI_ASK_USER_DISPLAY_MODE", "overlay");
+      expect((await captureOptions(await setupTool())).overlay).toBe(true);
+   });
+
+   test("saved displayMode overrides PI_ASK_USER_DISPLAY_MODE", async () => {
+      stubEnv("PI_ASK_USER_DISPLAY_MODE", "overlay");
+      expect(await captureOptions(await setupTool({ displayMode: "inline" }))).toBeUndefined();
+   });
+
+   test("an unrecognised PI_ASK_USER_DISPLAY_MODE falls back to inline", async () => {
+      stubEnv("PI_ASK_USER_DISPLAY_MODE", "sideways");
+      expect(await captureOptions(await setupTool())).toBeUndefined();
+   });
+});
+
+// ==========================================================================
+// Overlay hide/show toggle
+// ==========================================================================
+
+describe("overlay hide/show toggle (alt+o)", () => {
+   test("registers an onTerminalInput listener in overlay mode", async () => {
+      const tool = await setupTool({ displayMode: "overlay" });
+      let registered = 0;
+      await tool.execute("id", oneQuestion(), undefined, undefined, {
+         hasUI: true,
+         ui: {
+            onTerminalInput: () => { registered++; return () => { }; },
+            custom: async () => null,
+         },
+      });
+      expect(registered).toBe(1);
+   });
+
+   test("does not register onTerminalInput in inline mode", async () => {
+      const tool = await setupTool({ displayMode: "inline" });
+      let registered = 0;
+      await tool.execute("id", oneQuestion(), undefined, undefined, {
+         hasUI: true,
+         ui: { onTerminalInput: () => { registered++; return () => { }; }, custom: async () => null },
+      });
+      expect(registered).toBe(0);
+   });
+
+   test("alt+o toggles overlay visibility via OverlayHandle.setHidden", async () => {
+      const tool = await setupTool({ displayMode: "overlay" });
+      let listener: any;
+      const states: boolean[] = [];
+      let hidden = false;
+      const handle = { isHidden: () => hidden, setHidden(next: boolean) { hidden = next; states.push(next); } };
+      await tool.execute("id", oneQuestion(), undefined, undefined, {
+         hasUI: true,
+         ui: {
+            notify() { },
+            onTerminalInput: (cb: any) => { listener = cb; return () => { }; },
+            custom: async (_factory: any, options: any) => { options.onHandle?.(handle); return null; },
+         },
+      });
+      expect(listener("alt+o")).toEqual({ consume: true });
+      expect(listener("alt+o")).toEqual({ consume: true });
+      expect(states).toEqual([true, false]);
+   });
+
+   test("overlayToggleKey 'off' disables the listener entirely", async () => {
+      const tool = await setupTool({ displayMode: "overlay", overlayToggleKey: "off" });
+      let registered = 0;
+      await tool.execute("id", oneQuestion(), undefined, undefined, {
+         hasUI: true,
+         ui: { onTerminalInput: () => { registered++; return () => { }; }, custom: async () => null },
+      });
+      expect(registered).toBe(0);
+   });
+});
+
+// ==========================================================================
+// Single-select UI
+// ==========================================================================
+
+describe("single-select UI", () => {
+   test("confirm selects the focused option", async () => {
+      const tool = await setupTool();
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", oneQuestion({ question: "Pick?", options: opts2("Red", "Blue") }), undefined, undefined, { hasUI: true, ui });
+      press(state.component, "enter");
+      const result = await execution;
+      expect(result.details).toEqual({ answers: [{ question: "Pick?", kind: "option", answer: "Red" }], cancelled: false });
+   });
+
+   test("down then confirm selects the second option", async () => {
+      const tool = await setupTool();
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", oneQuestion({ question: "Pick?", options: opts2("Red", "Blue") }), undefined, undefined, { hasUI: true, ui });
+      press(state.component, "down", "enter");
+      const result = await execution;
+      expect(result.details.answers).toEqual([{ question: "Pick?", kind: "option", answer: "Blue" }]);
+   });
+
+   test("typed search filters before confirming", async () => {
+      const tool = await setupTool();
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", oneQuestion({ question: "Pick?", options: [opt("Chrome"), opt("Firefox"), opt("Safari")] }), undefined, undefined, { hasUI: true, ui });
+      press(state.component, "f", "enter");
+      const result = await execution;
+      expect(result.details.answers).toEqual([{ question: "Pick?", kind: "option", answer: "Firefox" }]);
+   });
+
+   test("the free-form row is always last and opens the editor", async () => {
+      const tool = await setupTool();
+      editorText = "";
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", oneQuestion({ question: "Pick?", options: opts2("Red", "Blue") }), undefined, undefined, { hasUI: true, ui });
+      press(state.component, "down", "down", "enter"); // two options, then free-form
+      expect(state.settled).toBe(false);
+      editorText = "Neither of those";
+      press(state.component, "enter");
+      const result = await execution;
+      expect(result.details.answers).toEqual([{ question: "Pick?", kind: "custom", answer: "Neither of those" }]);
+   });
+
+   test("ctrl+k at the top wraps to the free-form row", async () => {
+      const tool = await setupTool();
+      editorText = "";
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", oneQuestion({ question: "Pick?", options: opts2("Red", "Blue") }), undefined, undefined, { hasUI: true, ui });
+      press(state.component, "ctrl+k", "enter");
+      expect(state.settled).toBe(false);
+      editorText = "Wrapped";
+      press(state.component, "enter");
+      const result = await execution;
+      expect(result.details.answers).toEqual([{ question: "Pick?", kind: "custom", answer: "Wrapped" }]);
+   });
+
+   test("a blank free-form answer cancels instead of resolving", async () => {
+      const tool = await setupTool();
+      editorText = "   ";
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", oneQuestion({ options: opts2("Red", "Blue") }), undefined, undefined, { hasUI: true, ui });
+      press(state.component, "down", "down", "enter");
+      press(state.component, "enter"); // submits blank editorText
+      const result = await execution;
+      expect(result.details).toEqual({ answers: [], cancelled: true });
+   });
+
+   test("escape cancels from the select list", async () => {
+      const tool = await setupTool();
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", oneQuestion(), undefined, undefined, { hasUI: true, ui });
+      press(state.component, "escape");
+      const result = await execution;
+      expect(result.details).toEqual({ answers: [], cancelled: true });
+   });
+
+   test("escape from free-form returns to the select list", async () => {
+      const tool = await setupTool();
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", oneQuestion({ options: opts2("Red", "Blue") }), undefined, undefined, { hasUI: true, ui });
+      press(state.component, "down", "down", "enter"); // enter free-form
+      expect(state.settled).toBe(false);
+      press(state.component, "escape");                // back to the list
+      expect(state.settled).toBe(false);
+      press(state.component, "up", "up", "enter");      // move to an option and confirm
+      const result = await execution;
+      expect(result.details.answers).toEqual([{ question: "Continue?", kind: "option", answer: "Red" }]);
+   });
+
+   test("shows the header as the prompt title", async () => {
+      const tool = await setupTool();
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", oneQuestion({ question: "Pick?", header: "Deploy target" }), undefined, undefined, { hasUI: true, ui });
+      expect(state.component.render(100).join("\n")).toContain("Deploy target");
+      press(state.component, "enter");
+      await execution;
+   });
+});
+
+// ==========================================================================
+// Multi-select UI
+// ==========================================================================
+
+describe("multi-select UI", () => {
+   test("space toggles options and confirm returns a multi answer", async () => {
+      const tool = await setupTool();
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", oneQuestion({ question: "Pick?", options: [opt("A"), opt("B"), opt("C")], multiSelect: true }), undefined, undefined, { hasUI: true, ui });
+      press(state.component, "space", "down", "down", "space", "enter");
+      const result = await execution;
+      expect(result.details.answers).toEqual([{ question: "Pick?", kind: "multi", answer: null, selected: ["A", "C"] }]);
+   });
+
+   test("confirming with nothing checked falls back to the focused option", async () => {
+      const tool = await setupTool();
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", oneQuestion({ question: "Pick?", options: [opt("A"), opt("B")], multiSelect: true }), undefined, undefined, { hasUI: true, ui });
+      press(state.component, "down", "enter");
+      const result = await execution;
+      expect(result.details.answers).toEqual([{ question: "Pick?", kind: "multi", answer: null, selected: ["B"] }]);
+   });
+
+   test("the free-form row is available in multi-select mode", async () => {
+      const tool = await setupTool();
+      editorText = "";
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", oneQuestion({ question: "Pick?", options: [opt("A"), opt("B")], multiSelect: true }), undefined, undefined, { hasUI: true, ui });
+      press(state.component, "down", "down", "enter"); // two options, then free-form
+      editorText = "Something else";
+      press(state.component, "enter");
+      const result = await execution;
+      expect(result.details.answers).toEqual([{ question: "Pick?", kind: "custom", answer: "Something else" }]);
+   });
+});
+
+// ==========================================================================
+// RPC/headless fallback (custom() returns undefined)
+// ==========================================================================
+
+describe("RPC fallback", () => {
+   test("single-select falls back to ctx.ui.select() with the free-form sentinel", async () => {
+      const tool = await setupTool();
+      let selectTitle = "";
+      let selectOptions: string[] = [];
+      const result = await tool.execute("id", oneQuestion({ question: "Pick a color", options: [opt("Red"), opt("Blue")] }), undefined, undefined, {
+         hasUI: true,
+         ui: {
+            custom: async () => undefined,
+            select: async (title: string, opts: string[]) => { selectTitle = title; selectOptions = opts; return "Blue"; },
+            input: async () => undefined,
+         },
+      });
+      expect(result.details.answers).toEqual([{ question: "Pick a color", kind: "option", answer: "Blue" }]);
+      expect(selectTitle).toContain("Pick a color");
+      expect(selectOptions.slice(0, 2)).toEqual(["Red", "Blue"]);
+      expect(selectOptions[2]).toContain("Type custom response");
+   });
+
+   test("selecting the free-form sentinel follows up with input()", async () => {
+      const tool = await setupTool();
+      let inputCalled = false;
+      const sentinel = "✏️ Type custom response...";
+      const result = await tool.execute("id", oneQuestion({ options: [opt("Red"), opt("Blue")] }), undefined, undefined, {
+         hasUI: true,
+         ui: {
+            custom: async () => undefined,
+            select: async () => sentinel,
+            input: async () => { inputCalled = true; return "Custom answer"; },
+         },
+      });
+      expect(inputCalled).toBe(true);
+      expect(result.details.answers).toEqual([{ question: "Continue?", kind: "custom", answer: "Custom answer" }]);
+   });
+
+   test("multi-select degrades to input() listing the options", async () => {
+      const tool = await setupTool();
+      let inputTitle = "";
+      const result = await tool.execute("id", oneQuestion({ question: "Pick", options: [opt("Red"), opt("Blue"), opt("Green")], multiSelect: true }), undefined, undefined, {
+         hasUI: true,
+         ui: {
+            custom: async () => undefined,
+            select: async () => undefined,
+            input: async (title: string) => { inputTitle = title; return "Red, Green"; },
+         },
+      });
+      expect(result.details.answers).toEqual([{ question: "Pick", kind: "multi", answer: null, selected: ["Red", "Green"] }]);
+      expect(inputTitle).toContain("1. Red");
+      expect(inputTitle).toContain("select one or more");
+   });
+
+   test("returns cancelled when select() resolves undefined", async () => {
+      const tool = await setupTool();
+      const result = await tool.execute("id", oneQuestion({ options: [opt("Red"), opt("Blue")] }), undefined, undefined, {
+         hasUI: true,
+         ui: { custom: async () => undefined, select: async () => undefined, input: async () => undefined },
+      });
+      expect(result.details).toEqual({ answers: [], cancelled: true });
+   });
+
+   test("passes the timeout to the dialog stage", async () => {
+      const tool = await setupTool({ timeout: 5000 });
+      let capturedOpts: any;
+      await tool.execute("id", oneQuestion({ options: [opt("Red"), opt("Blue")] }), undefined, undefined, {
+         hasUI: true,
+         ui: { custom: async () => undefined, select: async (_t: string, _o: string[], opts: any) => { capturedOpts = opts; return "Red"; } },
+      });
+      expect(capturedOpts.signal).toBeInstanceOf(AbortSignal);
+      expect(capturedOpts.timeout).toBeGreaterThan(0);
+      expect(capturedOpts.timeout).toBeLessThanOrEqual(5000);
+   });
+});
+
+// ==========================================================================
+// Cancellation and timeout
+// ==========================================================================
+
+describe("cancellation and timeout", () => {
+   test("abort cancels a pending RPC dialog without another dialog", async () => {
+      const tool = await setupTool({ timeout: 5000 });
+      const controller = new AbortController();
+      let opened!: () => void;
+      const pending = new Promise<void>((resolve) => { opened = resolve; });
+      let dismissed = false;
+      let calls = 0;
+      const execution = tool.execute("id", oneQuestion({ options: [opt("A"), opt("B")] }), controller.signal, undefined, {
+         hasUI: true,
+         ui: {
+            custom: async () => undefined,
+            select: async (_t: string, _o: string[], opts: any) => {
+               calls++;
+               opened();
+               return await new Promise<string | undefined>((resolve) => {
+                  opts?.signal?.addEventListener("abort", () => { dismissed = true; resolve(undefined); }, { once: true });
+               });
+            },
+         },
+      });
+      await pending;
+      const callsBefore = calls;
+      controller.abort();
+      const result = await execution;
+      expect(dismissed).toBe(true);
+      expect(calls).toBe(callsBefore);
+      expect(result.details).toEqual({ answers: [], cancelled: true });
+   });
+
+   test("abort after the first RPC answer prevents a follow-up dialog", async () => {
+      const tool = await setupTool();
+      const controller = new AbortController();
+      let calls = 0;
+      const result = await tool.execute("id", oneQuestion({ options: [opt("A"), opt("B")] }), controller.signal, undefined, {
+         hasUI: true,
+         ui: {
+            custom: async () => undefined,
+            select: async (_t: string, options: string[]) => { calls++; controller.abort(); return options[options.length - 1]; },
+            input: async () => { calls++; return "A"; },
+         },
+      });
+      expect(calls).toBe(1);
+      expect(result.details).toEqual({ answers: [], cancelled: true });
+   });
 
    test("abort while custom UI is unavailable prevents opening an RPC dialog", async () => {
       const tool = await setupTool();
       const controller = new AbortController();
       let dialogs = 0;
-      const result = await tool.execute(
-         "id", { question: "Pick", options: ["A"] }, controller.signal, undefined,
-         { hasUI: true, ui: {
+      const result = await tool.execute("id", oneQuestion({ options: [opt("A"), opt("B")] }), controller.signal, undefined, {
+         hasUI: true,
+         ui: {
             custom: async () => { controller.abort(); return undefined; },
             select: async () => { dialogs++; return "A"; },
-         } },
-      );
-      expect(dialogs).toBe(0);
-      expect(result.details.cancelled).toBe(true);
-   });
-
-   for (const fullEvents of [false, true]) {
-      for (const answer of [undefined, null, "", "   "]) {
-         test(`displayed freeform cancellation emits one ${fullEvents ? "full" : "redacted"} event: ${JSON.stringify(answer)}`, async () => {
-            stubEnv("PI_ASK_USER_EMIT_FULL_EVENTS", String(fullEvents));
-            const tool = await setupTool();
-            const result = await tool.execute(
-               "id", { question: "Why?", context: "private context" }, undefined, undefined,
-               { hasUI: true, ui: { input: async () => answer } },
-            );
-            expect(result.details.cancelled).toBe(true);
-            expect(emittedEvents.filter((event) => event.name.startsWith("ask:"))).toEqual([
-               { name: "ask:cancelled", payload: fullEvents
-                  ? { question: "Why?", context: "private context", options: [] }
-                  : { question: "Why?" } },
-            ]);
-         });
-      }
-   }
-
-   test("abort between an RPC answer and its caller resuming still cancels", async () => {
-      const tool = await setupTool();
-      const controller = new AbortController();
-      const result = await tool.execute(
-         "id", { question: "Pick", options: ["A"] }, controller.signal, undefined,
-         { hasUI: true, ui: {
-            custom: async () => undefined,
-            select: async () => {
-               queueMicrotask(() => queueMicrotask(() => controller.abort()));
-               return "A";
-            },
-         } },
-      );
-      expect(result.details.cancelled).toBe(true);
-      expect(result.details.response).toBeNull();
-   });
-
-   test("already-aborted calls do not display or emit an outcome", async () => {
-      const tool = await setupTool();
-      const controller = new AbortController();
-      controller.abort();
-      const result = await tool.execute("id", { question: "Pick" }, controller.signal, undefined, { hasUI: true, ui: {} });
-      expect(result.details.cancelled).toBe(true);
-      expect(emittedEvents).toEqual([]);
-   });
-
-   for (const outcome of ["answer", "escape", "timeout", "abort", "factory-abort", "construction-error", "host-error"]) {
-      test(`custom ${outcome} releases owned resources and completes at most once`, async () => {
-         const tool = await setupTool();
-         const controller = new AbortController();
-         const timers = new Map<number, () => void>();
-         const callbacks: Array<() => void> = [];
-         const setTimer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void) => {
-            callbacks.push(callback);
-            const id = callbacks.length;
-            timers.set(id, callback);
-            return id;
-         }) as any);
-         const clearTimer = spyOn(globalThis, "clearTimeout").mockImplementation(((id: number) => { timers.delete(id); }) as any);
-         onTestFinished(() => { setTimer.mockRestore(); clearTimer.mockRestore(); });
-         let completions = 0;
-         let component: any;
-         let completedAtFactoryReturn = false;
-         const execution = tool.execute(
-            "id", { question: "Pick", options: ["A"], timeout: 3600000 }, controller.signal, undefined,
-            { hasUI: true, ui: {
-               custom: async (factory: any) => {
-                  if (outcome === "factory-abort") controller.abort();
-                  let resolve!: (value: any) => void;
-                  const completion = new Promise((done) => { resolve = done; });
-                  component = factory(
-                     { requestRender() {}, terminal: { rows: 24 } },
-                     outcome === "construction-error" ? { ...createTheme(), fg() { throw new Error("bad theme"); } } : createTheme(),
-                     createKeybindings(),
-                     (value: any) => { completions++; resolve(value); },
-                  );
-                  completedAtFactoryReturn = completions === 1;
-                  if (outcome === "host-error") throw new Error("host rejected custom UI");
-                  if (outcome === "answer") component.handleInput("enter");
-                  if (outcome === "escape") component.handleInput("escape");
-                  if (outcome === "timeout") callbacks[0]?.();
-                  if (outcome === "abort") controller.abort();
-                  // A broken factory-abort path must fail rather than leave the test pending.
-                  if (outcome === "factory-abort" && !completedAtFactoryReturn) component.handleInput("enter");
-                  return completion;
-               },
-            } },
-         );
-         const isError = outcome.endsWith("error");
-         if (isError) {
-            await expect(execution).rejects.toThrow(outcome === "construction-error" ? "bad theme" : "host rejected custom UI");
-         } else {
-            const result = await execution;
-            expect(result.details.cancelled).toBe(outcome !== "answer");
-         }
-         if (outcome === "factory-abort") expect(completedAtFactoryReturn).toBe(true);
-         expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
-         expect(timers.size).toBe(0);
-         callbacks.forEach((callback) => callback());
-         controller.abort();
-         component?.handleInput("enter");
-         expect(completions).toBe(isError ? 0 : 1);
-         expect(emittedEvents.filter((event) => event.name === "herdr:blocked").at(-1)?.payload).toEqual({ active: false });
+         },
       });
-   }
+      expect(dialogs).toBe(0);
+      expect(result.details).toEqual({ answers: [], cancelled: true });
+   });
+
+   test("the timeout cancels an open prompt", async () => {
+      const tool = await setupTool({ timeout: 1 });
+      const { state, ui } = mountPrompt();
+      const result = await tool.execute("id", oneQuestion(), undefined, undefined, { hasUI: true, ui });
+      expect(state.settled).toBe(true);
+      expect(result.details).toEqual({ answers: [], cancelled: true });
+   });
+
+   test("a late answer after timeout is rejected", async () => {
+      const tool = await setupTool({ timeout: 1 });
+      const { state, ui } = mountPrompt();
+      const result = await tool.execute("id", oneQuestion({ options: opts2("Red", "Blue") }), undefined, undefined, { hasUI: true, ui });
+      press(state.component, "enter"); // too late, already cancelled
+      expect(result.details).toEqual({ answers: [], cancelled: true });
+   });
 });
 
-describe("questions batch", () => {
-   type Ui = Record<string, (...args: any[]) => Promise<unknown>>;
+// ==========================================================================
+// Multi-question batch
+// ==========================================================================
 
-   function countingUi(calls: { count: number }): Ui {
-      const open = async () => {
-         calls.count++;
-         return undefined;
-      };
-      return { custom: open, select: open, input: open };
-   }
-
-   // Mounts the batch prompt synchronously; keys go to `state.component`.
-   function mountBatchPrompt(rows = 24) {
-      const state: { component?: any; settled: boolean } = { settled: false };
-      const custom = async (factory: any) => await new Promise((resolve) => {
-         state.component = factory(
-            { requestRender() { }, terminal: { rows } },
-            createTheme(),
-            createKeybindings(),
-            (value: unknown) => {
-               state.settled = true;
-               resolve(value);
-            },
-         );
-      });
-      return { state, custom };
-   }
-
-   const press = (component: any, ...keys: string[]) => keys.forEach((key) => component.handleInput(key));
-
-   const twoQuestions = [{ question: "First?" }, { question: "Second?" }];
-   const validationCases: Array<{ name: string; params: Record<string, unknown>; expected: string[]; noUI?: boolean }> = [
-      { name: "neither question nor questions", params: {}, expected: ["needs question"] },
-      { name: "both question and questions", params: { question: "Q?", questions: twoQuestions }, expected: ["exactly one of question or questions"] },
-      { name: "a single entry", params: { questions: [{ question: "Only?" }] }, expected: ["got 1", "use question instead"] },
-      { name: "five entries", params: { questions: ["A?", "B?", "C?", "D?", "E?"].map((question) => ({ question })) }, expected: ["at most 4"] },
-      { name: "a non-array questions value", params: { questions: "First?" }, expected: ["must be an array"] },
-      { name: "a blank question", params: { questions: [{ question: "  " }, { question: "Second?" }] }, expected: ["questions[0].question must be a non-empty string"] },
-      { name: "a duplicate question", params: { questions: [{ question: "Same?" }, { question: "same?" }] }, expected: ["questions[1] repeats the question"] },
-      {
-         name: "an entry whose options are all malformed",
-         params: { questions: [{ question: "First?" }, { question: "Second?", options: [{}, "  "] }] },
-         expected: ["in questions[1] were malformed", "{ \"title\": \"Short label\""],
-      },
-      {
-         name: "single-question fields at the top level",
-         params: { context: "shared", options: ["A"], questions: twoQuestions },
-         expected: ["context, options cannot be set at the top level"],
-      },
-      {
-         name: "no interactive UI",
-         params: { questions: [{ question: "First?", context: "Why it matters", options: ["Yes", "No"] }, { question: "Second?" }] },
-         expected: ["requires interactive mode", "1. First?", "Context: Why it matters", "   1. Yes", "   2. No", "2. Second?"],
-         noUI: true,
-      },
-   ];
-
-   for (const { name, params, expected, noUI } of validationCases) {
-      test(`throws before any UI or event for ${name}`, async () => {
-         const tool = await setupTool();
-         const calls = { count: 0 };
-         const error = await rejectedError(tool.execute(
-            "id", params, undefined, undefined,
-            noUI ? { hasUI: false } : { hasUI: true, ui: countingUi(calls) },
-         ));
-         for (const fragment of expected) expect(error.message).toContain(fragment);
-         expect(calls.count).toBe(0);
-         expect(emittedEvents).toEqual([]);
-      });
-   }
-
-   test("records each page's answer and publishes nothing until the review page submits", async () => {
-      stubEnv("PI_ASK_USER_EMIT_FULL_EVENTS", "false");
+describe("multi-question batch", () => {
+   test("records each answer and only the review page submits", async () => {
       const tool = await setupTool();
-      const { state, custom } = mountBatchPrompt();
-      const execution = tool.execute(
-         "id",
-         {
-            questions: [
-               { question: "Which database?", context: "private context", options: ["Postgres", "SQLite"] },
-               { question: "Anything else?" },
-            ],
-         },
-         undefined,
-         undefined,
-         { hasUI: true, ui: { custom } },
-      );
-      const prompt = state.component;
-      expect(prompt.render(100).join("\n")).toContain("ask_user [1] 2 · review");
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", batch([
+         { question: "First?", options: opts2("A", "B") },
+         { question: "Second?", options: opts2("X", "Y") },
+      ]), undefined, undefined, { hasUI: true, ui });
 
-      press(prompt, "enter"); // page 1 records Postgres and moves to page 2
-      editorText = "No"; // page 2 has no options, so it opens straight in the editor
-      press(prompt, "enter");
-      const review = prompt.render(100).join("\n");
-      expect(review).toContain("ask_user 1✓ 2✓ · [review]");
-      expect(review).toContain("→ Postgres");
-      expect(review).toContain("→ No");
+      press(state.component, "enter"); // answer question 1, advance to 2
       expect(state.settled).toBe(false);
-      expect(emittedEvents.filter((event) => event.name.startsWith("ask:"))).toEqual([]);
+      press(state.component, "down", "enter"); // answer question 2 with "Y", advance to review
+      expect(state.settled).toBe(false);
+      expect(state.component.render(120).join("\n")).toContain("Review answers");
+      press(state.component, "enter"); // submit from the review page
 
-      press(prompt, "enter");
       const result = await execution;
+      expect(state.settled).toBe(true);
       expect(result.details).toEqual({
-         kind: "batch",
-         questions: [
-            { question: "Which database?", context: "private context", options: [{ title: "Postgres" }, { title: "SQLite" }] },
-            { question: "Anything else?", options: [] },
-         ],
          answers: [
-            { status: "answered", response: { kind: "selection", selections: ["Postgres"] } },
-            { status: "answered", response: { kind: "freeform", text: "No" } },
+            { question: "First?", kind: "option", answer: "A" },
+            { question: "Second?", kind: "option", answer: "Y" },
          ],
          cancelled: false,
       });
-      expect(result.content).toEqual([{
-         type: "text",
-         text: "User answered 2 of 2 questions:\n1. Which database? → Postgres\n2. Anything else? → No",
-      }]);
-      expect(emittedEvents).toEqual([
-         { name: "herdr:blocked", payload: { active: true, label: "Waiting for user response" } },
-         { name: "herdr:blocked", payload: { active: false } },
-         { name: "ask:answered", payload: { question: "Which database?", response: { kind: "selection" }, batch: { index: 0, total: 2 } } },
-         { name: "ask:answered", payload: { question: "Anything else?", response: { kind: "freeform" }, batch: { index: 1, total: 2 } } },
-      ]);
    });
 
-   test("falls back to dialogs per question with each entry's own selection mode", async () => {
+   test("a single question submits directly without a review page", async () => {
       const tool = await setupTool();
-      const selects: Array<{ title: string; choices: string[] }> = [];
-      const inputs: string[] = [];
-      const result = await tool.execute(
-         "id",
-         {
-            questions: [
-               { question: "Pick one", options: [{ label: "A" }, { label: "B" }], allowFreeform: false },
-               { question: "Pick many", options: ["X", "Y", "Z"], allowMultiple: true },
-            ],
-         },
-         undefined,
-         undefined,
-         { hasUI: true, ui: {
-            custom: async () => undefined,
-            select: async (title: string, choices: string[]) => {
-               selects.push({ title, choices });
-               return "B";
-            },
-            input: async (title: string) => {
-               inputs.push(title);
-               return "X, Z";
-            },
-         } },
-      );
-
-      expect(selects).toEqual([{ title: "(1/2) Pick one", choices: ["A", "B"] }]);
-      expect(inputs).toHaveLength(1);
-      expect(inputs[0]).toContain("(2/2) Pick many");
-      expect(inputs[0]).toContain("Options (select one or more)");
-      expect(result.details.answers).toEqual([
-         { status: "answered", response: { kind: "selection", selections: ["B"] } },
-         { status: "answered", response: { kind: "selection", selections: ["X", "Z"] } },
-      ]);
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", oneQuestion({ question: "Only?", options: opts2("A", "B") }), undefined, undefined, { hasUI: true, ui });
+      expect(state.component.render(120).join("\n")).not.toContain("Review answers");
+      press(state.component, "enter");
+      const result = await execution;
+      expect(result.details.answers).toEqual([{ question: "Only?", kind: "option", answer: "A" }]);
    });
 
-   test("tab moves between pages without moving the option selection, and pages keep their state", async () => {
+   test("tab moves between pages and each page keeps its own option selection", async () => {
       const tool = await setupTool();
-      const { state, custom } = mountBatchPrompt();
-      const execution = tool.execute(
-         "id",
-         { questions: [{ question: "First?", options: ["A", "B", "C"] }, { question: "Second?", options: ["X"] }] },
-         undefined,
-         undefined,
-         { hasUI: true, ui: { custom } },
-      );
-      const prompt = state.component;
-      press(prompt, "down", "tab"); // highlight B, then leave page 1 unanswered
-      expect(prompt.render(100).join("\n")).toContain("ask_user 1 [2] · review");
-      press(prompt, "shift+tab", "enter", "enter", "enter"); // back to page 1, answer both, submit
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", batch([
+         { question: "First?", options: opts2("A", "B") },
+         { question: "Second?", options: opts2("X", "Y") },
+      ]), undefined, undefined, { hasUI: true, ui });
+      // Move page 1's selection to "B", then cycle page 1 -> page 2 -> review -> page 1.
+      press(state.component, "down");
+      press(state.component, "tab", "tab", "tab");
+      // Page 1 must still be on "B"; confirming answers "B" and advances to page 2,
+      // whose own selection was never touched, so it answers "X".
+      press(state.component, "enter");
+      press(state.component, "enter");
+      press(state.component, "enter"); // review submit
       const result = await execution;
       expect(result.details.answers).toEqual([
-         { status: "answered", response: { kind: "selection", selections: ["B"] } },
-         { status: "answered", response: { kind: "selection", selections: ["X"] } },
+         { question: "First?", kind: "option", answer: "B" },
+         { question: "Second?", kind: "option", answer: "X" },
       ]);
    });
 
-   test("submitting with unanswered questions needs a second confirmation and reports the skips", async () => {
-      stubEnv("PI_ASK_USER_EMIT_FULL_EVENTS", "false");
+   test("submitting with an unanswered question needs a second confirmation and drops the skip", async () => {
       const tool = await setupTool();
-      const { state, custom } = mountBatchPrompt();
-      const execution = tool.execute(
-         "id",
-         { questions: [{ question: "First?", options: ["A"] }, { question: "Second?", options: ["B"] }] },
-         undefined,
-         undefined,
-         { hasUI: true, ui: { custom } },
-      );
-      const prompt = state.component;
-      press(prompt, "enter", "tab", "enter"); // answer page 1, go to review, try to submit
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", batch([
+         { question: "First?", options: opts2("A", "B") },
+         { question: "Second?", options: opts2("X", "Y") },
+      ]), undefined, undefined, { hasUI: true, ui });
+      press(state.component, "enter");   // answer question 1
+      press(state.component, "tab");     // jump to the review page, leaving 2 unanswered
+      press(state.component, "enter");   // first press warns about the skip
       expect(state.settled).toBe(false);
-      const review = prompt.render(100).join("\n");
-      expect(review).toContain("○ 2. Second?");
-      expect(review).toContain("1 unanswered — press enter again to submit with skips");
-
-      press(prompt, "enter");
+      expect(state.component.render(120).join("\n")).toContain("unanswered");
+      press(state.component, "enter");   // second press submits
       const result = await execution;
-      expect(result.details.answers).toEqual([
-         { status: "answered", response: { kind: "selection", selections: ["A"] } },
-         { status: "skipped" },
-      ]);
-      expect(result.content).toEqual([{
-         type: "text",
-         text: "User answered 1 of 2 questions:\n1. First? → A\n2. Second? → (skipped)",
-      }]);
-      expect(emittedEvents.filter((event) => event.name.startsWith("ask:"))).toEqual([
-         { name: "ask:answered", payload: { question: "First?", response: { kind: "selection" }, batch: { index: 0, total: 2 } } },
-      ]);
+      expect(state.settled).toBe(true);
+      expect(result.details.answers).toEqual([{ question: "First?", kind: "option", answer: "A" }]);
    });
 
    test("re-answering a question from the review page replaces its earlier answer", async () => {
       const tool = await setupTool();
-      const { state, custom } = mountBatchPrompt();
-      const execution = tool.execute(
-         "id",
-         { questions: [{ question: "First?", options: ["A", "B"] }, { question: "Second?", options: ["X"] }] },
-         undefined,
-         undefined,
-         { hasUI: true, ui: { custom } },
-      );
-      // Answer A and X, jump back to question 1 from the review page, choose B, submit.
-      press(state.component, "enter", "enter", "1", "down", "enter", "enter");
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", batch([
+         { question: "First?", options: opts2("A", "B") },
+         { question: "Second?", options: opts2("X", "Y") },
+      ]), undefined, undefined, { hasUI: true, ui });
+      press(state.component, "enter", "enter"); // answer 1="A", 2="X", land on review
+      press(state.component, "1");              // jump back to question 1
+      press(state.component, "down", "enter");  // re-answer 1="B"
+      press(state.component, "enter");          // submit
       const result = await execution;
       expect(result.details.answers).toEqual([
-         { status: "answered", response: { kind: "selection", selections: ["B"] } },
-         { status: "answered", response: { kind: "selection", selections: ["X"] } },
+         { question: "First?", kind: "option", answer: "B" },
+         { question: "Second?", kind: "option", answer: "X" },
       ]);
    });
 
-   // Overlay: the 80x8 case where markers used to hide every answer. Inline:
-   // Pi's fullscreen dock clips inline prompts, so the review must stay short.
-   for (const { displayMode, rows, cap } of [
-      { displayMode: "overlay", rows: 8, cap: 6 },
-      // Two answer rows: overflow markers must not cover them.
-      { displayMode: "overlay", rows: 7, cap: 5 },
-      { displayMode: "inline", rows: 12, cap: 7 },
-   ]) {
-      test(`every answer stays reachable and the hints stay visible on a short ${displayMode} review`, async () => {
-         const tool = await setupTool();
-         const { state, custom } = mountBatchPrompt(rows);
-         const questions = ["First?", "Second?", "Third?", "Fourth?"];
-         const execution = tool.execute(
-            "id",
-            { questions: questions.map((question) => ({ question, options: [`Answer ${question}`] })), displayMode },
-            undefined,
-            undefined,
-            { hasUI: true, ui: { custom } },
-         );
-         const prompt = state.component;
-         press(prompt, "enter", "enter", "enter", "enter"); // all answered, now on the review page
-         const seen = new Set<string>();
-         for (let step = 0; step < 12; step++) {
-            const frame = prompt.render(80);
-            expect(frame.length).toBeLessThanOrEqual(cap);
-            expect(frame.join("\n")).toContain("submit");
-            for (const question of questions) {
-               if (frame.some((line: string) => line.includes(`. ${question}`))) seen.add(question);
-               if (frame.some((line: string) => line.includes(`→ Answer ${question}`))) seen.add(`→ ${question}`);
-            }
-            press(prompt, "down");
-         }
-         expect([...seen].sort()).toEqual([...questions, ...questions.map((question) => `→ ${question}`)].sort());
-
-         press(prompt, "enter");
-         expect((await execution).details.cancelled).toBe(false);
-      });
-   }
-
-   for (const outcome of ["esc on a page", "esc on the review page", "abort after the first answer", "timeout", "already aborted"] as const) {
-      test(`publishes no answers when the batch ends by ${outcome}`, async () => {
-         const timers: Array<{ callback: () => void; ms: number }> = [];
-         if (outcome === "timeout") {
-            const setTimer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, ms: number) => {
-               timers.push({ callback, ms });
-               return timers.length;
-            }) as any);
-            const clearTimer = spyOn(globalThis, "clearTimeout").mockImplementation((() => { }) as any);
-            onTestFinished(() => {
-               setTimer.mockRestore();
-               clearTimer.mockRestore();
-            });
-         }
-         const tool = await setupTool();
-         const controller = new AbortController();
-         if (outcome === "already aborted") controller.abort();
-         const { state, custom } = mountBatchPrompt();
-         let prompts = 0;
-         const execution = tool.execute(
-            "id",
-            { questions: [{ question: "First?", options: ["A"] }, { question: "Second?", options: ["B"] }], timeout: 1000 },
-            controller.signal,
-            undefined,
-            { hasUI: true, ui: { custom: async (factory: any) => { prompts++; return custom(factory); } } },
-         );
-         if (outcome !== "already aborted") {
-            press(state.component, "enter"); // the first answer is recorded, then the batch ends
-            if (outcome === "esc on a page") press(state.component, "escape");
-            if (outcome === "esc on the review page") press(state.component, "tab", "escape");
-            if (outcome === "abort after the first answer") controller.abort();
-            if (outcome === "timeout") {
-               expect(timers.map((timer) => timer.ms)).toEqual([1000]); // one timer for the whole batch
-               timers[0]!.callback();
-            }
-         }
-         const result = await execution;
-
-         expect(result.details).toMatchObject({ kind: "batch", answers: [], cancelled: true });
-         expect(emittedEvents.some((event) => event.name === "ask:answered")).toBe(false);
-         if (outcome === "already aborted") {
-            expect(prompts).toBe(0);
-            expect(emittedEvents).toEqual([]);
-            return;
-         }
-         expect(prompts).toBe(1);
-         expect(result.content).toEqual([{ type: "text", text: "User cancelled the questions" }]);
-         expect(emittedEvents.filter((event) => event.name.startsWith("ask:"))).toEqual([
-            { name: "ask:cancelled", payload: { question: "First?", batch: { index: 0, total: 2 } } },
-            { name: "ask:cancelled", payload: { question: "Second?", batch: { index: 1, total: 2 } } },
-         ]);
-      });
-   }
-
-   test("an abort during the initial update cancels the batch before any prompt opens", async () => {
+   test("escape on a page cancels the whole batch", async () => {
       const tool = await setupTool();
-      const controller = new AbortController();
-      let prompts = 0;
-      const open = async () => {
-         prompts++;
-         return "answer";
-      };
-      const result = await tool.execute(
-         "id",
-         { questions: [{ question: "First?" }, { question: "Second?" }] },
-         controller.signal,
-         () => controller.abort(),
-         { hasUI: true, ui: { custom: open, select: open, input: open } },
-      );
-      expect(prompts).toBe(0);
-      expect(result.details).toMatchObject({ kind: "batch", answers: [], cancelled: true });
-      expect(emittedEvents.some((event) => event.name === "ask:answered")).toBe(false);
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", batch([
+         { question: "First?", options: opts2() },
+         { question: "Second?", options: opts2() },
+      ]), undefined, undefined, { hasUI: true, ui });
+      press(state.component, "escape");
+      const result = await execution;
+      expect(result.details).toEqual({ answers: [], cancelled: true });
    });
 
-   for (const honorsSignal of [true, false]) {
-      test(`the batch deadline closes an open dialog and rejects a late answer (host ${honorsSignal ? "honors" : "ignores"} the signal)`, async () => {
-         let now = 0;
-         const timers: Array<{ callback: () => void; ms: number }> = [];
-         const clock = spyOn(Date, "now").mockImplementation(() => now);
-         const setTimer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, ms: number) => {
-            timers.push({ callback, ms });
-            return timers.length;
-         }) as any);
-         const clearTimer = spyOn(globalThis, "clearTimeout").mockImplementation((() => { }) as any);
-         onTestFinished(() => {
-            clock.mockRestore();
-            setTimer.mockRestore();
-            clearTimer.mockRestore();
-         });
-         const tool = await setupTool();
-         const selectTimeouts: number[] = [];
-         let answerLate!: (value: string) => void;
-         let secondOpened!: () => void;
-         const opened = new Promise<void>((resolve) => { secondOpened = resolve; });
-         const execution = tool.execute(
-            "id",
-            { questions: [{ question: "First?", options: ["A"] }, { question: "Second?", options: ["B"] }], timeout: 1000 },
-            undefined,
-            undefined,
-            { hasUI: true, ui: {
-               custom: async () => undefined,
-               select: async (_title: string, choices: string[], opts: any) => {
-                  selectTimeouts.push(opts?.timeout);
-                  if (selectTimeouts.length === 1) {
-                     now = 600;
-                     return choices[0];
+   test("escape on the review page cancels the whole batch", async () => {
+      const tool = await setupTool();
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", batch([
+         { question: "First?", options: opts2("A", "B") },
+         { question: "Second?", options: opts2("X", "Y") },
+      ]), undefined, undefined, { hasUI: true, ui });
+      press(state.component, "enter", "enter"); // both answered, on review
+      press(state.component, "escape");
+      const result = await execution;
+      expect(result.details).toEqual({ answers: [], cancelled: true });
+   });
+
+   test("the batch falls back to sequential RPC dialogs", async () => {
+      const tool = await setupTool();
+      const selects: string[] = [];
+      const result = await tool.execute("id", batch([
+         { question: "First?", options: opts2("A", "B") },
+         { question: "Second?", options: opts2("X", "Y") },
+      ]), undefined, undefined, {
+         hasUI: true,
+         ui: {
+            custom: async () => undefined,
+            select: async (title: string, choices: string[]) => { selects.push(title); return choices[0]; },
+         },
+      });
+      expect(result.details.answers).toEqual([
+         { question: "First?", kind: "option", answer: "A" },
+         { question: "Second?", kind: "option", answer: "X" },
+      ]);
+      expect(selects[0]).toContain("(1/2) First?");
+      expect(selects[1]).toContain("(2/2) Second?");
+   });
+
+   test("the batch title shows page progress", async () => {
+      const tool = await setupTool();
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", batch([
+         { question: "First?", options: opts2() },
+         { question: "Second?", options: opts2() },
+      ]), undefined, undefined, { hasUI: true, ui });
+      expect(state.component.render(120).join("\n")).toContain("ask_user_question");
+      press(state.component, "escape");
+      await execution;
+   });
+});
+
+// ==========================================================================
+// TypeBox shim compatibility (exported StringEnum helper)
+// ==========================================================================
+
+describe("issue #38 typebox shim compatibility", () => {
+   // Fakes stand in for the real builders; their signatures are narrower than
+   // TypeBox's generics, so the cast is the only way to hand them to StringEnum.
+   const realTypeBoxLike = {
+      Unsafe: (schema: Record<string, unknown>) => ({ ...schema }),
+      Optional: (schema: unknown) => schema,
+      Union: () => {
+         throw new Error("union path must not run on real TypeBox");
+      },
+      Literal: (value: unknown) => value,
+   } as unknown as StringEnumBuilder;
+
+   type RuntimeSchema = {
+      runtime: true;
+      members: unknown[];
+      meta: Record<string, unknown>;
+      or: () => RuntimeSchema;
+      describe: (text: string) => RuntimeSchema;
+      default: (value: unknown) => RuntimeSchema;
+   };
+   const runtimeSchema = (members: unknown[], meta: Record<string, unknown> = {}): RuntimeSchema => ({
+      runtime: true,
+      members,
+      meta,
+      or: () => runtimeSchema(members, meta),
+      describe: (text) => runtimeSchema(members, { ...meta, description: text }),
+      default: (value) => runtimeSchema(members, { ...meta, default: value }),
+   });
+   const isRuntimeSchema = (value: unknown): value is RuntimeSchema =>
+      typeof value === "object" && value !== null && "or" in value && typeof value.or === "function";
+   // Mirrors oh-my-pi's legacy-typebox shim: Unsafe yields a plain object,
+   // Optional evaluates `asRuntime(schema).or(...)`, Union ignores options.
+   const ompOptional = (schema: unknown) => {
+      if (!isRuntimeSchema(schema)) throw new TypeError("asRuntime(schema).or is not a function");
+      return schema.or();
+   };
+   const ompLike = {
+      Unsafe: (schema: Record<string, unknown>) => ({ ...schema }),
+      Optional: ompOptional,
+      Union: (members: unknown[]) => runtimeSchema(members),
+      Literal: (value: unknown) => ({ literal: value }),
+   } as unknown as StringEnumBuilder;
+
+   test("emits the flat enum on hosts whose Type.Optional accepts Type.Unsafe", async () => {
+      const { StringEnum } = await import("./index");
+      const schema: unknown = StringEnum(["overlay", "inline"] as const, { description: "mode", default: "overlay" }, realTypeBoxLike);
+      expect(schema).toEqual({ type: "string", enum: ["overlay", "inline"], description: "mode", default: "overlay" });
+   });
+
+   test("falls back to a literal union that Type.Optional can wrap on omp-style shims", async () => {
+      const { StringEnum } = await import("./index");
+      const schema: unknown = StringEnum(["overlay", "inline"] as const, { description: "mode" }, ompLike);
+      if (!isRuntimeSchema(schema)) throw new Error("expected a runtime union schema");
+      expect(schema.members).toEqual([{ literal: "overlay" }, { literal: "inline" }]);
+      expect(schema.meta).toEqual({ description: "mode" });
+      expect(() => ompOptional(schema)).not.toThrow();
+   });
+});
+
+// ==========================================================================
+// Layout: split-pane details, list fallback, preview
+// ==========================================================================
+
+describe("single-select layout", () => {
+   async function renderList(tool: RegisteredTool, options: any[], width: number, keys: string[] = []) {
+      let rendered = "";
+      await tool.execute("id", oneQuestion({ options }), undefined, undefined, {
+         hasUI: true,
+         ui: {
+            custom: async (factory: any) => {
+               const component = factory(
+                  { requestRender() { }, terminal: { rows: 24 } },
+                  createTheme(),
+                  createKeybindings(),
+                  () => { },
+               );
+               for (const key of keys) component.handleInput(key);
+               rendered = (component as any).pages[0].singleSelectList.render(width).join("\n");
+               return null;
+            },
+         },
+      });
+      return rendered;
+   }
+
+   test("renders a details pane for wide single-select layouts", async () => {
+      const tool = await setupTool();
+      const rendered = await renderList(tool, [
+         opt("Alpha", "The alpha option keeps the rollout conservative."),
+         opt("Beta", "The beta option favors faster iteration."),
+      ], 120);
+      expect(rendered).toContain("## Alpha");
+      expect(rendered).toContain("The alpha option keeps the rollout conservative.");
+   });
+
+   test("prefers the option preview over its description in the details pane", async () => {
+      const tool = await setupTool();
+      const rendered = await renderList(tool, [
+         opt("Alpha", "Short description.", "A much longer preview body for Alpha."),
+         opt("Beta", "Beta description."),
+      ], 120);
+      expect(rendered).toContain("A much longer preview body for Alpha.");
+      expect(rendered).not.toContain("Short description.");
+   });
+
+   test("keeps wide single-select prompts in one column when the layout is list", async () => {
+      const tool = await setupTool({ singleSelectLayout: "list" });
+      const rendered = await renderList(tool, [
+         opt("Alpha", "The alpha option stays below its title."),
+         opt("Beta", "The beta option stays below its title."),
+      ], 120);
+      expect(rendered).toContain("The alpha option stays below its title.");
+      expect(rendered).not.toContain("## Alpha");
+   });
+
+   test("falls back to the single-column list on narrow widths", async () => {
+      const tool = await setupTool();
+      const rendered = await renderList(tool, [
+         opt("Alpha", "The alpha option keeps the rollout conservative."),
+         opt("Beta", "The beta option favors faster iteration."),
+      ], 60);
+      expect(rendered).toContain("Alpha");
+      expect(rendered).not.toContain("## Alpha");
+   });
+
+   test("shows a custom response preview on the free-form row", async () => {
+      const tool = await setupTool();
+      const rendered = await renderList(tool, opts2(), 120, ["down", "down"]);
+      expect(rendered).toContain("Custom response");
+      expect(rendered).toContain("Open the editor to write **any** answer.");
+   });
+
+   test("PI_ASK_USER_SINGLE_SELECT_LAYOUT applies unless saved configuration overrides it", async () => {
+      stubEnv("PI_ASK_USER_SINGLE_SELECT_LAYOUT", "list");
+      const fromEnv = await setupTool();
+      expect(await renderList(fromEnv, [opt("Alpha", "Below the title."), opt("Beta", "Second.")], 120)).not.toContain("## Alpha");
+
+      const overridden = await setupTool({ singleSelectLayout: "auto" });
+      expect(await renderList(overridden, [opt("Alpha", "Below the title."), opt("Beta", "Second.")], 120)).toContain("## Alpha");
+   });
+});
+
+// ==========================================================================
+// Rendering under constrained viewports
+// ==========================================================================
+
+describe("constrained viewports", () => {
+   test("scrolls a constrained multi-select overlay to the free-form row", async () => {
+      const tool = await setupTool({ displayMode: "overlay" });
+      let initialRendered: string[] = [];
+      let lastOptionRendered: string[] = [];
+      let freeformRendered: string[] = [];
+      await tool.execute("id", oneQuestion({
+         question: "Which option should we use?",
+         header: "Rollout",
+         // Empty descriptions keep one row per item so the scroll cap engages.
+         options: [opt("Option 1", ""), opt("Option 2", ""), opt("Option 3", ""), opt("Option 4", "")],
+         multiSelect: true,
+      }), undefined, undefined, {
+         hasUI: true,
+         ui: {
+            custom: async (factory: any) => {
+               const component = factory(
+                  { requestRender() { }, terminal: { rows: 10 } },
+                  createTheme(), createKeybindings(), () => { },
+               );
+               initialRendered = component.render(50);
+               for (let index = 0; index < 3; index += 1) component.handleInput("down");
+               lastOptionRendered = component.render(50);
+               component.handleInput("down");
+               freeformRendered = component.render(50);
+               return null;
+            },
+         },
+      });
+      expect(initialRendered.join("\n")).toContain("Rollout");
+      expect(initialRendered.join("\n")).toContain("(1/5)");
+      expect(lastOptionRendered.join("\n")).toContain("Option 4");
+      expect(lastOptionRendered.join("\n")).toContain("(4/5)");
+      expect(freeformRendered.join("\n")).toContain("Type something.");
+      expect(freeformRendered.join("\n")).toContain("(5/5)");
+      expect(freeformRendered.join("\n")).not.toContain("…");
+   });
+
+   test("keeps the editor visible in a constrained overlay", async () => {
+      const tool = await setupTool({ displayMode: "overlay" });
+      editorText = "A fairly long custom answer that should stay visible.";
+      let rendered: string[] = [];
+      await tool.execute("id", oneQuestion({ options: opts2() }), undefined, undefined, {
+         hasUI: true,
+         ui: {
+            custom: async (factory: any) => {
+               const component = factory(
+                  { requestRender() { }, terminal: { rows: 12 } },
+                  createTheme(), createKeybindings(), () => { },
+               );
+               press(component, "down", "down", "enter");
+               rendered = component.render(50);
+               return null;
+            },
+         },
+      });
+      expect(rendered.join("\n")).toContain("Custom response");
+   });
+
+   test("does not apply overlay viewport clipping in inline mode", async () => {
+      const tool = await setupTool({ displayMode: "inline" });
+      let rendered: string[] = [];
+      await tool.execute("id", oneQuestion({
+         question: "Which option should we use?",
+         options: [opt("Option 1"), opt("Option 2"), opt("Option 3"), opt("Option 4")],
+         multiSelect: true,
+      }), undefined, undefined, {
+         hasUI: true,
+         ui: {
+            custom: async (factory: any) => {
+               const component = factory(
+                  { requestRender() { }, terminal: { rows: 8 } },
+                  createTheme(), createKeybindings(), () => { },
+               );
+               rendered = component.render(60);
+               return null;
+            },
+         },
+      });
+      const joined = rendered.join("\n");
+      expect(joined).toContain("Option 1");
+      expect(joined).toContain("Option 4");
+   });
+
+   test("does not crash when the host theme singleton is uninitialised (regression for #17)", async () => {
+      // The mocked getMarkdownTheme returns closures that throw on every read,
+      // mirroring a host whose theme singleton was never initialised. Rendering
+      // must stay quiet instead of crashing mid-render.
+      const tool = await setupTool();
+      let constructionError: unknown;
+      let renderError: unknown;
+      try {
+         await tool.execute("id", oneQuestion({ options: [opt("Alpha", "desc a"), opt("Beta", "desc b")] }), undefined, undefined, {
+            hasUI: true,
+            ui: {
+               custom: async (factory: any) => {
+                  const component = factory(
+                     { requestRender() { }, terminal: { rows: 24 } },
+                     createTheme(), createKeybindings(), () => { },
+                  );
+                  try {
+                     (component as any).pages[0].singleSelectList.render(120);
+                  } catch (error) {
+                     renderError = error;
                   }
-                  secondOpened();
-                  return new Promise((resolve) => {
-                     answerLate = resolve;
-                     if (honorsSignal) opts?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
-                  });
+                  return null;
                },
-            } },
-         );
-         await opened;
-         // The second dialog shows the remaining 400ms, but one batch timer owns the deadline.
-         expect(selectTimeouts).toEqual([1000, 400]);
-         expect(timers.map((timer) => timer.ms)).toEqual([1000]);
-         timers[0]!.callback();
-         answerLate("B"); // only reaches the batch when the host ignores the signal
-         const result = await execution;
+            },
+         });
+      } catch (error) {
+         constructionError = error;
+      }
+      expect(constructionError).toBeUndefined();
+      expect(renderError).toBeUndefined();
+   });
+});
 
-         expect(result.details).toMatchObject({ kind: "batch", answers: [], cancelled: true });
-         expect(emittedEvents.some((event) => event.name === "ask:answered")).toBe(false);
+// ==========================================================================
+// Documented examples match the registered schema
+// ==========================================================================
+
+describe("documented examples", () => {
+   for (const file of ["README.md", "skills/ask-user/SKILL.md", "skills/ask-user/references/ask-user-skill-extension-spec.md"]) {
+      test(`${file} examples all match the registered schema`, async () => {
+         const tool = await setupTool();
+         const schema = tool.parameters;
+         const examples = [...readFileSync(file, "utf8").matchAll(/^```json[ \t]*\r?\n([\s\S]*?)^```[ \t]*\r?$/gm)];
+         expect(examples.length).toBeGreaterThan(0);
+         for (const example of examples) {
+            const args = JSON.parse(example[1]!);
+            expect(Array.isArray(args.questions)).toBe(true);
+            expect(args.questions.length).toBeGreaterThanOrEqual(schema.properties.questions.minItems);
+            expect(args.questions.length).toBeLessThanOrEqual(schema.properties.questions.maxItems);
+            for (const key of Object.keys(args)) expect(Object.hasOwn(schema.properties, key)).toBe(true);
+            for (const entry of args.questions) {
+               for (const key of Object.keys(entry)) {
+                  expect(Object.hasOwn(schema.properties.questions.items.properties, key)).toBe(true);
+               }
+               expect(typeof entry.question).toBe("string");
+               expect(entry.question.trim().length).toBeGreaterThan(0);
+               expect(typeof entry.header).toBe("string");
+               expect(Array.isArray(entry.options)).toBe(true);
+               expect(entry.options.length).toBeGreaterThanOrEqual(2);
+               expect(entry.options.length).toBeLessThanOrEqual(4);
+               const labels = entry.options.map((option: any) => {
+                  expect(typeof option.label).toBe("string");
+                  expect(typeof option.description).toBe("string");
+                  return option.label;
+               });
+               expect(new Set(labels).size).toBe(labels.length);
+            }
+         }
       });
    }
-
-   test("renders batch calls and results without falling back to the single-question renderer", async () => {
-      const tool = await setupTool();
-      const theme = createTheme();
-      const call = (tool as any).renderCall(
-         { questions: [{ question: "Which database?", options: ["Postgres", "SQLite"] }, { question: "Anything else?" }] },
-         theme,
-      ).render(200).join("\n");
-      expect(call).toContain("2 questions");
-      expect(call).toContain("1. Which database? (2 option(s))");
-      expect(call).toContain("2. Anything else?");
-
-      const details = {
-         kind: "batch",
-         questions: [
-            { question: "Which database?", context: "private context", options: [{ title: "Postgres" }, { title: "SQLite" }] },
-            { question: "Anything else?", options: [] },
-         ],
-         answers: [
-            { status: "answered", response: { kind: "selection", selections: ["Postgres"] } },
-            { status: "answered", response: { kind: "freeform", text: "No" } },
-         ],
-         cancelled: false,
-      };
-      const render = (renderDetails: unknown, expanded: boolean, context?: unknown) => tool.renderResult(
-         { content: [{ type: "text", text: "boom" }], details: renderDetails },
-         { expanded, isPartial: false },
-         theme,
-         context,
-      ).render(200).join("\n");
-
-      const collapsed = render(details, false);
-      expect(collapsed).toContain("✓ 2 of 2 answered");
-      expect(collapsed).toContain("1. Which database? → Postgres");
-      expect(collapsed).toContain("2. Anything else? → (wrote) No");
-      expect(collapsed).not.toContain("private context");
-
-      const expanded = render(details, true);
-      expect(expanded).toContain("private context");
-      expect(expanded).toContain("● Postgres");
-      expect(expanded).toContain("○ SQLite");
-
-      const skipped = render({ ...details, answers: [details.answers[0], { status: "skipped" }] }, false);
-      expect(skipped).toContain("✓ 1 of 2 answered");
-      expect(skipped).toContain("2. Anything else? → (skipped)");
-
-      expect(render({ ...details, answers: [], cancelled: true }, false)).toBe("Cancelled");
-      expect(render(details, false, { isError: true })).toBe("✗ boom");
-   });
 });

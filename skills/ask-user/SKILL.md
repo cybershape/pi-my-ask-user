@@ -1,6 +1,6 @@
 ---
 name: ask-user
-description: "You MUST use this before high-stakes architectural decisions, irreversible changes, or when requirements are ambiguous. Runs a decision handshake with the ask_user tool: summarize context, present structured options, collect explicit user choice, then proceed."
+description: "You MUST use this before high-stakes architectural decisions, irreversible changes, or when requirements are ambiguous. Runs a decision handshake with the ask_user_question tool: summarize context, present structured options, collect explicit user choice, then proceed."
 metadata:
   short-description: Decision gate for ambiguity and high-stakes choices
 ---
@@ -13,7 +13,7 @@ This skill is about **decision control**, not general chit-chat.
 
 ## Non-negotiable rule
 
-Invoke `ask_user` before proceeding when **any** of the following is true:
+Invoke `ask_user_question` before proceeding when **any** of the following is true:
 
 1. The next step changes architecture, schema, API contracts, deployment strategy, or security posture.
 2. The work is costly to undo (large refactor, migration, destructive edit, production-facing behavior change).
@@ -41,23 +41,33 @@ Before asking, gather context from available tools (`read`, `bash`, `exa`, `ref`
 Do not ask the user to decide blind.
 
 ### 3) Synthesize context
-Prepare a short neutral summary (3-7 bullets or short paragraph) covering:
+Write a short neutral summary (3-7 bullets or short paragraph) covering:
 - current state
 - key constraints
 - trade-offs
 - recommendation (if any)
 
-### 4) Ask one focused question
-Call `ask_user` with one decision at a time:
-- `question`: concrete decision prompt
-- `context`: synthesized summary
-- `options`: 2-5 clear choices when possible
-- `allowMultiple`: `false` unless independent selections are genuinely needed
-- `allowFreeform`: usually `true`
-- `displayMode` *(optional)*: `"overlay"` (default) or `"inline"`. Use `"inline"` when preceding assistant context (summary, trade-offs, recommendation) is essential to the decision and should remain visible — overlays cover the conversation underneath. The user may set a personal default via the `PI_ASK_USER_DISPLAY_MODE` environment variable; only pass this when you intentionally want to override it for one call.
-- `contextExpanded` *(optional)*: `true` opens oversized context fully expanded instead of collapsed behind a one-line summary. The user may set a personal default via `PI_ASK_USER_CONTEXT_EXPANDED`; only pass this when the context is the evidence the user needs to weigh the options.
+The tool has no `context` field, so put this summary in your own message **before** the call.
+The prompt shows only the `header`, the `question`, and the option labels and descriptions.
 
-When 2-4 decisions at the same boundary are independent of each other and their prerequisites are settled, you may ask them together with `questions` instead of `question`. Each entry carries its own `question`, `context`, `options`, `allowMultiple`, and `allowFreeform`. Never batch a decision whose options depend on another answer; ask it in a later call once that answer is known.
+### 4) Ask one focused question
+Call `ask_user_question` with a required `questions` array. Use one entry for one decision:
+
+- `question`: concrete decision prompt
+- `header`: short group label shown above the question, e.g. `Storage`, `Deploy target`
+- `options`: **2-4** entries, each with a required `label` and a required `description`
+  - `label` is the value returned when the user picks it, and must be unique within the question
+  - `label` may not be `Other`, `Type something.`, or `Next` — the prompt adds its own free-form row
+  - `description` explains the trade-off in one line
+  - `preview` *(optional)* is a longer body shown beside the option on wide terminals
+- `multiSelect` *(optional)*: `true` only when independent selections are genuinely needed
+
+Display, layout, shortcuts and timeout are user preferences configured through
+`/ask-user-question-settings`, never tool parameters. Do not send them in a call.
+
+When 2-4 decisions at the same boundary are independent of each other and their prerequisites
+are settled, you may ask them together as 2-4 entries of `questions`. Never batch a decision
+whose options depend on another answer; ask it in a later call once that answer is known.
 
 ### 5) Commit the decision
 After response:
@@ -69,20 +79,33 @@ After response:
 Ask again only if materially new uncertainty appears.
 Avoid repetitive confirmation loops.
 
+## Reading the answer
+
+`details.answers` holds one entry per question the user actually answered, each with:
+
+- `question`: the question text it answers
+- `kind`: `option` (one label picked), `multi` (several labels picked), or `custom` (free-form row used)
+- `answer`: the chosen label, or the typed text for `custom`, or `null` for `multi`
+- `selected`: the chosen labels, present only for `multi`
+
+Questions the user left unanswered on the review page are dropped, so `answers` can be shorter
+than the questions you sent. Treat a missing answer as unanswered rather than as agreement.
+`cancelled: true` means the whole prompt was dismissed.
+
 ## Anti-overasking guardrails (required)
 
 Apply a strict question budget per decision boundary:
 
-- **Max 1** `ask_user` call per decision boundary in normal cases.
-- **Max 2** `ask_user` calls for the same boundary when first response is unclear/cancelled.
+- **Max 1** `ask_user_question` call per decision boundary in normal cases.
+- **Max 2** `ask_user_question` calls for the same boundary when first response is unclear/cancelled.
 - Never ask the same trade-off again without new evidence.
 
 Escalation ladder:
 
-1. **Attempt 1:** structured options + concise context.
+1. **Attempt 1:** structured options + a concise summary in your own message.
 2. **Attempt 2 (only if needed):** narrower question with agent recommendation and explicit choices:
    - `Proceed with recommended option`
-   - `Choose another option` (freeform)
+   - `Choose another option`
    - `Stop for now`
 
 After attempt 2:
@@ -90,7 +113,7 @@ After attempt 2:
 - If boundary is `high_stakes` or `both`: **stop and mark blocked**. Do not keep asking.
 - If boundary is `ambiguous` only and user says “your call” or equivalent: proceed with the most reversible default and state assumptions explicitly.
 
-## `ask_user` payload quality standard
+## `ask_user_question` payload quality standard
 
 ### Question quality
 Use:
@@ -108,7 +131,8 @@ Options must be:
 - short and outcome-oriented
 - explicit on trade-offs
 
-Good options include a short description when trade-offs are non-obvious.
+Every option needs a description that states what choosing it means. Use `preview` when the
+user genuinely needs to read a longer body before deciding.
 
 ## Recommended patterns
 
@@ -116,14 +140,16 @@ Good options include a short description when trade-offs are non-obvious.
 
 ```json
 {
-  "question": "Which caching strategy should we use for the first release?",
-  "context": "Current API has p95 latency issues. Redis is fastest but adds infra complexity; in-memory cache is simpler but not shared across instances.",
-  "options": [
-    { "title": "In-memory cache", "description": "Simpler rollout, weaker horizontal consistency" },
-    { "title": "Redis cache", "description": "Better consistency and scalability, more ops overhead" }
-  ],
-  "allowMultiple": false,
-  "allowFreeform": true
+  "questions": [
+    {
+      "question": "Which caching strategy should we use for the first release?",
+      "header": "Caching",
+      "options": [
+        { "label": "In-memory cache", "description": "Simpler rollout, weaker horizontal consistency" },
+        { "label": "Redis cache", "description": "Better consistency and scalability, more ops overhead" }
+      ]
+    }
+  ]
 }
 ```
 
@@ -131,16 +157,19 @@ Good options include a short description when trade-offs are non-obvious.
 
 ```json
 {
-  "question": "Select the first-wave hardening items to implement now.",
-  "context": "We can ship quickly with baseline controls, then add targeted hardening. Budget is limited to 1-2 days.",
-  "options": [
-    { "title": "Rate limiting" },
-    { "title": "Audit logging" },
-    { "title": "Input schema validation" },
-    { "title": "Secrets rotation" }
-  ],
-  "allowMultiple": true,
-  "allowFreeform": true
+  "questions": [
+    {
+      "question": "Select the first-wave hardening items to implement now.",
+      "header": "Hardening",
+      "options": [
+        { "label": "Rate limiting", "description": "Blocks abuse before it reaches the app" },
+        { "label": "Audit logging", "description": "Traces who changed what, for compliance" },
+        { "label": "Input schema validation", "description": "Rejects malformed payloads at the edge" },
+        { "label": "Secrets rotation", "description": "Limits blast radius of a leaked credential" }
+      ],
+      "multiSelect": true
+    }
+  ]
 }
 ```
 
@@ -151,16 +180,19 @@ Good options include a short description when trade-offs are non-obvious.
   "questions": [
     {
       "question": "Which logging backend should the service use?",
-      "context": "Both integrate with the existing middleware; only the hosted option needs a new vendor contract.",
+      "header": "Logging",
       "options": [
-        { "title": "Self-hosted Loki", "description": "No new vendor, more ops work" },
-        { "title": "Hosted Datadog", "description": "Fastest setup, recurring cost" }
+        { "label": "Self-hosted Loki", "description": "No new vendor, more ops work" },
+        { "label": "Hosted Datadog", "description": "Fastest setup, recurring cost" }
       ]
     },
     {
       "question": "Should the first release include the admin dashboard?",
-      "options": [{ "title": "Include it" }, { "title": "Defer it" }],
-      "allowFreeform": false
+      "header": "Scope",
+      "options": [
+        { "label": "Include it", "description": "Support can self-serve from day one" },
+        { "label": "Defer it", "description": "Ships sooner, support escalates to engineering" }
+      ]
     }
   ]
 }
@@ -168,17 +200,21 @@ Good options include a short description when trade-offs are non-obvious.
 
 ## Anti-patterns
 
-- Asking `ask_user` without first gathering context
+- Asking `ask_user_question` without first gathering context
+- Putting the context summary in an option description instead of your own message
 - Using it for trivial formatting choices
-- Forcing options when freeform is clearly better
+- Sending 1 option, or 5+ options, or options without descriptions
+- Using a reserved label (`Other`, `Type something.`, `Next`) as an option
 - Asking the same question repeatedly without new information
 - Batching dependent decisions in `questions`, or using a batch to dodge the one-decision-per-question rule
+- Passing `displayMode`, `singleSelectLayout`, `overlayToggleKey`, or `timeout` in a call
 - Proceeding with high-stakes implementation after unclear/cancelled answer
+- Treating a question dropped from `answers` as if the user agreed
 
 ## If user cancels or answer is unclear
 
 Pause execution and explain what is blocked.
-Use at most one narrower follow-up `ask_user` question (attempt 2).
+Use at most one narrower follow-up `ask_user_question` question (attempt 2).
 After that, do not continue asking in a loop:
 - for high-stakes decisions: remain blocked until explicit decision
 - for ambiguity-only decisions: proceed only if user delegated the choice ("your call")

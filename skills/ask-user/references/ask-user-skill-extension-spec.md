@@ -2,13 +2,13 @@
 
 ## Purpose
 
-This document defines a minimal decision-gating protocol for using the `ask-user` skill with the `ask_user` tool.
+This document defines a minimal decision-gating protocol for using the `ask-user` skill with the `ask_user_question` tool.
 
 Goal: require explicit user decisions at high-impact or ambiguous boundaries before implementation continues.
 
 ---
 
-## 1) Trigger Matrix (When to Call `ask_user`)
+## 1) Trigger Matrix (When to Call `ask_user_question`)
 
 | Scenario | Must Ask? | Why |
 |---|---:|---|
@@ -31,16 +31,17 @@ Use this protocol whenever the trigger matrix says to ask.
    - classify as `high_stakes`, `ambiguous`, `both`, or `clear`
 2. **Gather evidence**
    - read code/docs/logs first; do not ask blindly
-3. **Summarize context**
-   - prepare concise trade-off context (3–7 bullets or short paragraph)
+3. **Summarize context in your own message**
+   - write concise trade-off context (3–7 bullets or short paragraph) before the call;
+     the tool has no `context` field, so it cannot carry the summary for you
 4. **Ask one focused question**
-   - call `ask_user` for one decision at a time; 2-4 independent decisions with settled prerequisites may go together in `questions`
+   - call `ask_user_question` for one decision at a time; 2-4 independent decisions with settled prerequisites may go together in `questions`
 5. **Commit and proceed**
    - restate chosen option and implement accordingly
 
 ### Retry/cancel policy
 
-- Max **2** `ask_user` attempts for the same decision boundary.
+- Max **2** `ask_user_question` attempts for the same decision boundary.
 - Attempt 1: normal structured question.
 - Attempt 2: narrower question with recommendation and explicit options.
 - After attempt 2:
@@ -49,58 +50,108 @@ Use this protocol whenever the trigger matrix says to ask.
 
 ---
 
-## 3) Example Payloads
+## 3) Tool contract
+
+The tool accepts only `questions` at the top level. Never include `displayMode`, `singleSelectLayout`, `overlayToggleKey`, or `timeout` in a tool call.
+
+Users configure these preferences through `/ask-user-question-settings`. Settings persist globally in a dedicated `ask-user-settings.json` file in Pi's user directory. Saved settings override existing environment preferences, which override built-in defaults. `displayMode` defaults to `inline`; layout defaults to `auto`, the overlay shortcut to `alt+o`, and timeout to disabled. Respect user preferences; do not change them without an explicit request.
+
+Each `questions` entry (1-4 entries per call):
+
+| Field | Required | Constraint |
+|---|---|---|
+| `question` | yes | Non-empty; must be unique across the batch |
+| `header` | yes | Non-empty short group label shown above the question |
+| `options` | yes | 2-4 entries |
+| `multiSelect` | no | `false` by default |
+
+Each option:
+
+| Field | Required | Constraint |
+|---|---|---|
+| `label` | yes | Unique within the question; never `Other`, `Type something.`, or `Next` |
+| `description` | yes | One line on what choosing it means |
+| `preview` | no | Longer body shown beside the option on wide terminals |
+
+The prompt always appends its own free-form row, so never add one yourself — which is why those three labels are rejected.
+
+Calls that violate any rule above are rejected before any UI opens, with a message naming the offending field.
+
+---
+
+## 4) Example payloads
 
 ### Architecture decision
 
 ```json
 {
-  "question": "Which implementation path should we use for v1?",
-  "context": "Path A is faster to ship but less extensible. Path B takes longer but supports plugin-style growth. Existing deadline is 2 weeks.",
-  "options": [
-    { "title": "Path A (ship fast)", "description": "Lowest scope, revisit architecture later" },
-    { "title": "Path B (extensible)", "description": "Higher initial effort, cleaner long-term composition" }
-  ],
-  "allowMultiple": false,
-  "allowFreeform": true
+  "questions": [
+    {
+      "question": "Which implementation path should we use for v1?",
+      "header": "Roadmap",
+      "options": [
+        { "label": "Path A (ship fast)", "description": "Lowest scope, revisit architecture later", "preview": "Ships in 2 weeks: no plugin hooks, single storage backend, and a migration that must be redone when plugin support lands." },
+        { "label": "Path B (extensible)", "description": "Higher initial effort, cleaner long-term composition" }
+      ]
+    }
+  ]
 }
 ```
-
-### Display mode (optional)
-
-The `ask_user` tool accepts an optional `displayMode` parameter:
-
-- `"overlay"` *(default)*: centered modal; covers the conversation underneath.
-- `"inline"`: rendered in the conversation flow; preceding messages stay visible.
-
-Guidance:
-
-- Omit `displayMode` to respect the user's configured preference (`PI_ASK_USER_DISPLAY_MODE` environment variable).
-- Pass `"inline"` only when the immediately preceding assistant message (summary, trade-offs, recommendation) is the primary context for the decision and must remain visible.
-- Pass `"overlay"` only to explicitly force the modal style (rare).
-
-### Batches (optional)
-
-`questions` replaces `question` with 2-4 entries, each with its own `question`, `context`, `options`, `allowMultiple`, and `allowFreeform`. The user answers them on separate pages and submits from a review page, where unanswered questions can be submitted as skipped.
-
-Guidance:
-
-- Batch only decisions that are independent and whose prerequisites are settled.
-- Treat each entry as its own decision boundary for the retry/cancel policy.
-- Skipped entries come back as `{ "status": "skipped" }`; handle them like an unclear answer for that decision.
 
 ### Requirement-priority decision
 
 ```json
 {
-  "question": "Which requirement should be prioritized first?",
-  "context": "Current request mixes performance tuning and UI redesign. Doing both now risks delaying delivery.",
-  "options": [
-    { "title": "Performance first" },
-    { "title": "UI redesign first" },
-    { "title": "Do a minimal pass on both" }
-  ],
-  "allowMultiple": false,
-  "allowFreeform": true
+  "questions": [
+    {
+      "question": "Which requirement should be prioritized first?",
+      "header": "Priority",
+      "options": [
+        { "label": "Performance first", "description": "Ship the tuning pass, redesign later" },
+        { "label": "UI redesign first", "description": "Visible progress, performance debt stays" },
+        { "label": "Minimal pass on both", "description": "Slowest overall, no large debt" }
+      ]
+    }
+  ]
 }
 ```
+
+### Independent decisions at one checkpoint
+
+`questions` carries 1-4 entries. With 2-4 entries the user answers on separate pages and submits
+from a review page, where unanswered questions can be submitted as dropped.
+
+- Batch only decisions that are independent and whose prerequisites are settled.
+- Treat each entry as its own decision boundary for the retry/cancel policy.
+- A missing entry comes back as no answer at all; handle it like an unclear answer for that decision.
+
+---
+
+## 5) Result contract
+
+The tool result's `details`:
+
+```typescript
+interface AskAnswer {
+  question: string;
+  kind: "option" | "custom" | "multi";
+  answer: string | null;
+  selected?: string[];
+}
+
+interface AskResultDetails {
+  answers: AskAnswer[];
+  cancelled: boolean;
+  error?: string;
+}
+```
+
+Reading it:
+
+- `answers` holds one entry per question the user actually answered, in question order.
+- `kind: "option"` → `answer` is the chosen label.
+- `kind: "multi"` → `answer` is `null` and `selected` lists the chosen labels.
+- `kind: "custom"` → the user took the free-form row; `answer` is their typed text.
+- A question the user skipped on the review page is **dropped**, so `answers` can be shorter than `questions`. Treat a missing entry as unanswered, not as agreement.
+- `cancelled: true` with `answers: []` means the prompt was dismissed, timed out, or aborted.
+- The tool emits no answer or cancellation events; read the result instead.

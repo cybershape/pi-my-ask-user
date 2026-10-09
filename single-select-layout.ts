@@ -1,6 +1,7 @@
 export interface QuestionOption {
-	title: string;
+	label: string;
 	description?: string;
+	preview?: string;
 }
 
 export interface AnnotatedRow {
@@ -12,9 +13,6 @@ export interface RenderSingleSelectRowsParams {
 	options: QuestionOption[];
 	selectedIndex: number;
 	width: number;
-	allowFreeform: boolean;
-	allowComment?: boolean;
-	commentEnabled?: boolean;
 	maxRows?: number;
 	hideDescriptions?: boolean;
 }
@@ -74,36 +72,26 @@ interface ItemBlock {
 
 type ListItem =
 	| { type: "option"; option: QuestionOption }
-	| { type: "comment-toggle"; option: QuestionOption }
 	| { type: "freeform"; option: QuestionOption };
 
 function buildItemBlocks(
 	options: QuestionOption[],
 	width: number,
-	allowFreeform: boolean,
-	allowComment: boolean,
-	commentEnabled: boolean,
 	selectedIndex: number,
 	hideDescriptions = false,
 ): ItemBlock[] {
 	const normalizedWidth = Math.max(12, width);
 	const freeformLabel = "Type something. — Enter a custom response";
-	const commentToggleLabel = `${commentEnabled ? "[✓]" : "[ ]"} Add extra context after selection`;
 	const allItems: ListItem[] = options.map((option) => ({ type: "option", option }));
-	if (allowComment) {
-		allItems.push({ type: "comment-toggle", option: { title: commentToggleLabel } });
-	}
-	if (allowFreeform) {
-		allItems.push({ type: "freeform", option: { title: freeformLabel } });
-	}
+	allItems.push({ type: "freeform", option: { label: freeformLabel } });
 
 	return allItems.map((item, itemIndex) => {
 		const pointer = itemIndex === selectedIndex ? "→" : " ";
 		const lines: string[] = [];
 
-		if (item.type === "comment-toggle" || item.type === "freeform") {
+		if (item.type === "freeform") {
 			const prefix = `${pointer}   `;
-			const wrapped = wrapText(item.option.title, Math.max(8, normalizedWidth - prefix.length));
+			const wrapped = wrapText(item.option.label, Math.max(8, normalizedWidth - prefix.length));
 			wrapped.forEach((line, lineIndex) => {
 				lines.push(padLine(lineIndex === 0 ? prefix : " ".repeat(prefix.length), line));
 			});
@@ -112,7 +100,7 @@ function buildItemBlocks(
 
 		const numberPrefix = `${pointer} ${itemIndex + 1}. `;
 		const continuationPrefix = " ".repeat(numberPrefix.length);
-		const titleLines = wrapText(item.option.title, Math.max(8, normalizedWidth - numberPrefix.length));
+		const titleLines = wrapText(item.option.label, Math.max(8, normalizedWidth - numberPrefix.length));
 		titleLines.forEach((line, lineIndex) => {
 			lines.push(padLine(lineIndex === 0 ? numberPrefix : continuationPrefix, line));
 		});
@@ -145,14 +133,11 @@ export function renderSingleSelectRows({
 	options,
 	selectedIndex,
 	width,
-	allowFreeform,
-	allowComment = false,
-	commentEnabled = false,
 	maxRows,
 	hideDescriptions,
 }: RenderSingleSelectRowsParams): AnnotatedRow[] {
-	const itemCount = options.length + (allowComment ? 1 : 0) + (allowFreeform ? 1 : 0);
-	const blocks = buildItemBlocks(options, width, allowFreeform, allowComment, commentEnabled, selectedIndex, hideDescriptions);
+	const itemCount = options.length + 1;
+	const blocks = buildItemBlocks(options, width, selectedIndex, hideDescriptions);
 	const allRows = flatten(blocks, selectedIndex);
 
 	if (!Number.isFinite(maxRows) || !maxRows || maxRows <= 0 || allRows.length <= maxRows) {
