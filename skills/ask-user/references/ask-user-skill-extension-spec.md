@@ -61,7 +61,7 @@ Each `questions` entry (1-4 entries per call):
 | Field | Required | Constraint |
 |---|---|---|
 | `question` | yes | Non-empty; must be unique across the batch |
-| `header` | yes | Non-empty short group label shown above the question |
+| `header` | yes | Non-empty short group label shown in the prompt's top border, above the question. Keep it brief; it is ellipsised on narrow terminals |
 | `options` | yes | 2-4 entries |
 | `multiSelect` | no | `false` by default |
 

@@ -7,6 +7,8 @@ export interface QuestionOption {
 export interface AnnotatedRow {
 	line: string;
 	selected: boolean;
+	/** True for the free-form row's placeholder text while it holds no draft. */
+	placeholder: boolean;
 }
 
 export interface RenderSingleSelectRowsParams {
@@ -15,7 +17,14 @@ export interface RenderSingleSelectRowsParams {
 	width: number;
 	maxRows?: number;
 	hideDescriptions?: boolean;
+	/** Text the user already typed in the free-form editor, if any. */
+	freeformDraft?: string;
 }
+
+/** Shown on the numbered free-form row while the user has typed nothing. */
+export const FREEFORM_PLACEHOLDER = "Type something.";
+/** Hint under the free-form row while it still holds no draft. */
+export const FREEFORM_HINT = "Enter a custom response";
 
 function wrapText(text: string, width: number): string[] {
 	const normalized = text.replace(/\s+/g, " ").trim();
@@ -65,9 +74,14 @@ function padLine(prefix: string, content: string): string {
 	return `${prefix}${content}`.trimEnd();
 }
 
+interface ItemLine {
+	text: string;
+	placeholder: boolean;
+}
+
 interface ItemBlock {
 	itemIndex: number;
-	lines: string[];
+	lines: ItemLine[];
 }
 
 type ListItem =
@@ -79,40 +93,42 @@ function buildItemBlocks(
 	width: number,
 	selectedIndex: number,
 	hideDescriptions = false,
+	freeformDraft = "",
 ): ItemBlock[] {
 	const normalizedWidth = Math.max(12, width);
-	const freeformLabel = "Type something. — Enter a custom response";
+	const draft = freeformDraft.trim();
+	// The free-form row is numbered like every other row. Until the user types
+	// something it shows a dim placeholder plus a hint, mirroring an empty
+	// input field; once a draft exists the row shows that draft instead.
 	const allItems: ListItem[] = options.map((option) => ({ type: "option", option }));
-	allItems.push({ type: "freeform", option: { label: freeformLabel } });
+	allItems.push({ type: "freeform", option: { label: draft || FREEFORM_PLACEHOLDER } });
 
 	return allItems.map((item, itemIndex) => {
 		const pointer = itemIndex === selectedIndex ? "→" : " ";
-		const lines: string[] = [];
-
-		if (item.type === "freeform") {
-			const prefix = `${pointer}   `;
-			const wrapped = wrapText(item.option.label, Math.max(8, normalizedWidth - prefix.length));
-			wrapped.forEach((line, lineIndex) => {
-				lines.push(padLine(lineIndex === 0 ? prefix : " ".repeat(prefix.length), line));
-			});
-			return { itemIndex, lines };
-		}
+		const lines: ItemLine[] = [];
+		const isFreeform = item.type === "freeform";
+		const placeholder = isFreeform && !draft;
 
 		const numberPrefix = `${pointer} ${itemIndex + 1}. `;
 		const continuationPrefix = " ".repeat(numberPrefix.length);
 		const titleLines = wrapText(item.option.label, Math.max(8, normalizedWidth - numberPrefix.length));
 		titleLines.forEach((line, lineIndex) => {
-			lines.push(padLine(lineIndex === 0 ? numberPrefix : continuationPrefix, line));
+			lines.push({
+				text: padLine(lineIndex === 0 ? numberPrefix : continuationPrefix, line),
+				placeholder,
+			});
 		});
 
-		if (item.option.description && !hideDescriptions) {
+		const description = isFreeform ? (placeholder ? FREEFORM_HINT : undefined) : item.option.description;
+		if (description && !hideDescriptions) {
 			const descriptionPrefix = "      ";
 			const descriptionLines = wrapText(
-				item.option.description,
+				description,
 				Math.max(8, normalizedWidth - descriptionPrefix.length),
 			);
 			descriptionLines.forEach((line) => {
-				lines.push(padLine(descriptionPrefix, line));
+				// The free-form hint belongs to the empty state, so it is dim too.
+				lines.push({ text: padLine(descriptionPrefix, line), placeholder });
 			});
 		}
 
@@ -123,8 +139,9 @@ function buildItemBlocks(
 function flatten(blocks: ItemBlock[], selectedIndex: number): AnnotatedRow[] {
 	return blocks.flatMap((block) =>
 		block.lines.map((line) => ({
-			line,
+			line: line.text,
 			selected: block.itemIndex === selectedIndex,
+			placeholder: line.placeholder,
 		})),
 	);
 }
@@ -135,9 +152,10 @@ export function renderSingleSelectRows({
 	width,
 	maxRows,
 	hideDescriptions,
+	freeformDraft,
 }: RenderSingleSelectRowsParams): AnnotatedRow[] {
 	const itemCount = options.length + 1;
-	const blocks = buildItemBlocks(options, width, selectedIndex, hideDescriptions);
+	const blocks = buildItemBlocks(options, width, selectedIndex, hideDescriptions, freeformDraft);
 	const allRows = flatten(blocks, selectedIndex);
 
 	if (!Number.isFinite(maxRows) || !maxRows || maxRows <= 0 || allRows.length <= maxRows) {
@@ -153,10 +171,11 @@ export function renderSingleSelectRows({
 
 	if (selectedBlock.lines.length >= availableRows) {
 		const visible = selectedBlock.lines.slice(0, availableRows).map((line) => ({
-			line,
+			line: line.text,
 			selected: true,
+			placeholder: line.placeholder,
 		}));
-		if (safeMaxRows > 1) visible.push({ line: indicator, selected: false });
+		if (safeMaxRows > 1) visible.push({ line: indicator, selected: false, placeholder: false });
 		return visible.slice(0, safeMaxRows);
 	}
 
@@ -183,6 +202,6 @@ export function renderSingleSelectRows({
 	}
 
 	const visible = flatten(blocks.slice(start, end), selectedIndex);
-	visible.push({ line: indicator, selected: false });
+	visible.push({ line: indicator, selected: false, placeholder: false });
 	return visible.slice(0, safeMaxRows);
 }

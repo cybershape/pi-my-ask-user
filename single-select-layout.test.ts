@@ -100,4 +100,44 @@ describe("renderSingleSelectRows", () => {
 		}
 		expect(nonSelectedRows.length).toBeGreaterThan(0);
 	});
+
+	test("numbers the free-form row and flags its placeholder while empty", () => {
+		const rows = renderSingleSelectRows({
+			options: [{ label: "Alpha" }, { label: "Beta" }],
+			selectedIndex: 2,
+			width: 40,
+		});
+		const freeform = rows.find((row) => row.line.includes("Type something."));
+		expect(freeform).toBeDefined();
+		expect(freeform!.line).toContain("3.");
+		expect(freeform!.placeholder).toBe(true);
+		const hint = rows.find((row) => row.line.includes("Enter a custom response"));
+		expect(hint).toBeDefined();
+		expect(hint!.placeholder).toBe(true);
+	});
+
+	test("shows the free-form draft instead of the placeholder once typed", () => {
+		const rows = renderSingleSelectRows({
+			options: [{ label: "Alpha" }, { label: "Beta" }],
+			selectedIndex: 2,
+			width: 40,
+			freeformDraft: "use syslog",
+		});
+		const freeform = rows.find((row) => row.line.includes("use syslog"));
+		expect(freeform).toBeDefined();
+		expect(freeform!.line).toContain("3.");
+		expect(freeform!.placeholder).toBe(false);
+		expect(rows.some((row) => row.line.includes("Type something."))).toBe(false);
+		expect(rows.some((row) => row.line.includes("Enter a custom response"))).toBe(false);
+	});
+
+	test("treats a whitespace-only draft as empty", () => {
+		const rows = renderSingleSelectRows({
+			options: [{ label: "Alpha" }, { label: "Beta" }],
+			selectedIndex: 2,
+			width: 40,
+			freeformDraft: "   ",
+		});
+		expect(rows.some((row) => row.line.includes("Type something."))).toBe(true);
+	});
 });

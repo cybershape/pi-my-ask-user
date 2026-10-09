@@ -40,7 +40,7 @@ import {
    visibleWidth,
    wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import { renderSingleSelectRows, type QuestionOption } from "./single-select-layout";
+import { renderSingleSelectRows, FREEFORM_HINT, FREEFORM_PLACEHOLDER, type QuestionOption } from "./single-select-layout";
 
 import { createRequire } from "node:module";
 import { join } from "node:path";
@@ -191,7 +191,7 @@ const BATCH_MAX_QUESTIONS = 4;
 const BATCH_MIN_OPTIONS = 2;
 const BATCH_MAX_OPTIONS = 4;
 /** Labels the prompt UI reserves for its own rows, so models may not use them. */
-const RESERVED_OPTION_LABELS = ["Other", "Type something.", "Next"] as const;
+const RESERVED_OPTION_LABELS = ["Other", FREEFORM_PLACEHOLDER, "Next"] as const;
 // Removed top-level fields: every question's data belongs inside questions.
 const BATCH_ENTRY_FIELDS = ["question", "header", "options", "multiSelect"] as const;
 
@@ -271,6 +271,8 @@ function createEditorTheme(theme: Theme): EditorTheme {
 const BOX_BORDER_LEFT = "│ ";
 const BOX_BORDER_RIGHT = " │";
 const BOX_BORDER_OVERHEAD = BOX_BORDER_LEFT.length + BOX_BORDER_RIGHT.length;
+// Cells a framed box keeps around its title/label: `─ ` + label + ` ─`.
+const TITLE_MIN_INNER = 4;
 
 class BoxBorderTop implements Component {
    private color: (s: string) => string;
@@ -284,12 +286,26 @@ class BoxBorderTop implements Component {
    invalidate(): void { }
    render(width: number): string[] {
       const inner = Math.max(0, width - 2);
-      if (!this.title || inner < this.title.length + 4) {
+      // Measure in rendered cells, not code units: a CJK or fullwidth title is
+      // twice as wide as its length suggests, which would push the corner out
+      // of the frame.
+      // Too narrow for any label: plain border. A title that overflows is
+      // truncated so it stays visible instead of disappearing.
+      if (inner < TITLE_MIN_INNER) {
          return [this.color(`╭${"─".repeat(inner)}╮`)];
       }
-      const label = ` ${this.title} `;
-      const remaining = inner - 1 - label.length;
+      if (!this.title) {
+         return [this.color(`╭${"─".repeat(inner)}╮`)];
+      }
       const titleStyle = this.titleColor ?? this.color;
+      if (inner < visibleWidth(this.title) + TITLE_MIN_INNER) {
+         const clipped = truncateToWidth(this.title, inner - TITLE_MIN_INNER, "…");
+         return [
+            this.color("╭─") + titleStyle(` ${clipped} `) + this.color("─".repeat(Math.max(0, inner - 1 - visibleWidth(clipped) - 2)) + "╮"),
+         ];
+      }
+      const label = ` ${this.title} `;
+      const remaining = inner - 1 - visibleWidth(label);
       return [
          this.color("╭─") + titleStyle(label) + this.color("─".repeat(Math.max(0, remaining)) + "╮"),
       ];
@@ -308,11 +324,11 @@ class BoxBorderBottom implements Component {
    invalidate(): void { }
    render(width: number): string[] {
       const inner = Math.max(0, width - 2);
-      if (!this.label || inner < this.label.length + 4) {
+      if (!this.label || inner < visibleWidth(this.label) + 4) {
          return [this.color(`╰${"─".repeat(inner)}╯`)];
       }
       const tag = ` ${this.label} `;
-      const leftDashes = inner - tag.length - 1;
+      const leftDashes = inner - visibleWidth(tag) - 1;
       const style = this.labelColor ?? this.color;
       return [
          this.color("╰" + "─".repeat(Math.max(0, leftDashes))) + style(tag) + this.color("─╯"),
@@ -387,12 +403,6 @@ const SINGLE_SELECT_SPLIT_PANE_RIGHT_MIN_WIDTH = 28;
 const SINGLE_SELECT_SPLIT_PANE_SEPARATOR = " │ ";
 const FREEFORM_SENTINEL = "\u270f\ufe0f Type custom response...";
 const DEFAULT_OVERLAY_TOGGLE_KEY = "alt+o";
-// Header eyebrow row: `DEPLOY TARGET ─────────`. Below this width the row is
-// dropped entirely rather than shown as a truncated fragment.
-const HEADER_MIN_WIDTH = 6;
-// Cells between the label and its rule, and the narrowest rule worth drawing.
-const HEADER_LABEL_GAP = 1;
-const HEADER_MIN_RULE_WIDTH = 4;
 
 // Vim-style aliases for navigating option lists. ctrl+j/k are safe in the
 // searchable single-select because they don't collide with fuzzy-search input.
@@ -484,6 +494,7 @@ class MultiSelectList implements Component {
       options: QuestionOption[],
       theme: Theme,
       keybindings: KeybindingsManager,
+      private getFreeformDraft: () => string,
    ) {
       this.options = options;
       this.theme = theme;
@@ -607,10 +618,26 @@ class MultiSelectList implements Component {
          const block: string[] = [];
 
          if (this.isFreeformRow(i)) {
-            const label = theme.fg("text", theme.bold("Type something."));
-            const desc = theme.fg("muted", "Enter a custom response");
-            const line = `${prefix}   ${label} ${theme.fg("dim", "—")} ${desc}`;
-            block.push(truncateToWidth(line, width, ""));
+            // The free-form row is numbered like the options. While it holds no
+            // draft it shows a dim placeholder and hint, like an empty input
+            // field; once the user has typed something the row shows that text.
+            // The blank checkbox slot keeps its text aligned with option titles.
+            const draft = this.getFreeformDraft().trim();
+            const num = theme.fg("dim", `${i + 1}.`);
+            const title = draft || FREEFORM_PLACEHOLDER;
+            const styledTitle = isSelected
+               ? theme.fg("accent", theme.bold(title))
+               : draft
+                  ? theme.fg("text", theme.bold(title))
+                  : theme.fg("dim", title);
+            block.push(truncateToWidth(`${prefix} ${num}     ${styledTitle}`, width, ""));
+            if (!draft) {
+               const indent = "      ";
+               const wrapWidth = Math.max(10, width - indent.length);
+               for (const wrapped of wrapTextWithAnsi(FREEFORM_HINT, wrapWidth)) {
+                  block.push(truncateToWidth(indent + theme.fg("dim", wrapped), width, ""));
+               }
+            }
             blocks.push(block);
             continue;
          }
@@ -707,6 +734,7 @@ class WrappedSingleSelectList implements Component {
       theme: Theme,
       singleSelectLayout: AskSingleSelectLayout,
       keybindings: KeybindingsManager,
+      private getFreeformDraft: () => string,
    ) {
       this.options = options;
       this.theme = theme;
@@ -770,10 +798,25 @@ class WrappedSingleSelectList implements Component {
       return character;
    }
 
-   private styleListLine(line: string, width: number, isSelected: boolean): string {
+   private styleListLine(line: string, width: number, isSelected: boolean, placeholder = false): string {
       const trimmed = line.trim();
 
       if (trimmed.startsWith("(")) {
+         return truncateToWidth(this.theme.fg("dim", line), width, "");
+      }
+
+      // An empty free-form row keeps its number and pointer in the usual
+      // colours but dims the placeholder text and its hint, like an empty
+      // input field waiting for the user.
+      if (placeholder) {
+         const numbered = line.match(/^([→ ] \d+\. )/);
+         if (numbered) {
+            const prefix = numbered[1]!;
+            const styledPrefix = isSelected
+               ? this.theme.fg("accent", this.theme.bold(prefix))
+               : this.theme.fg("text", prefix);
+            return truncateToWidth(styledPrefix + this.theme.fg("dim", line.slice(prefix.length)), width, "");
+         }
          return truncateToWidth(this.theme.fg("dim", line), width, "");
       }
 
@@ -836,8 +879,9 @@ class WrappedSingleSelectList implements Component {
          width,
          maxRows,
          hideDescriptions,
+         freeformDraft: this.getFreeformDraft(),
       });
-      const optionLines = optionRows.map((row) => this.styleListLine(row.line, width, row.selected));
+      const optionLines = optionRows.map((row) => this.styleListLine(row.line, width, row.selected, row.placeholder));
 
       lines.push(...optionLines);
       return lines.slice(0, this.maxVisibleRows);
@@ -996,7 +1040,6 @@ class WrappedSingleSelectList implements Component {
  */
 class AskComponent extends Container {
    private question: string;
-   private header: string;
    private options: QuestionOption[];
    private multiSelect: boolean;
    private displayMode: AskDisplayMode;
@@ -1012,8 +1055,9 @@ class AskComponent extends Container {
    private promptScrollOffset = 0;
    private promptMaxScrollOffset = 0;
    private promptViewportRows = 0;
-   // A batch page shows its position in the frame title and a navigation hint.
-   private frameTitle = "ask_user_question";
+   // The frame title is this question's header; a batch page replaces it with
+   // its own progress strip via setBatchChrome.
+   private frameTitle: string;
    private navigationHint: string | null = null;
 
    // Static layout components
@@ -1054,7 +1098,7 @@ class AskComponent extends Container {
       super();
 
       this.question = question;
-      this.header = header;
+      this.frameTitle = header;
       this.options = options;
       this.multiSelect = multiSelect;
       this.displayMode = displayMode;
@@ -1202,33 +1246,8 @@ class AskComponent extends Container {
       return this.questionText.render(width);
    }
 
-   /**
-    * The question's `header` as an eyebrow row above it: an uppercased label
-    * followed by a hairline rule filling the rest of the width. Both are
-    * measured in rendered cells, never code units, so CJK, fullwidth and emoji
-    * headers stay aligned with the box border. The label is uppercased before
-    * measuring because uppercasing can itself widen text ("ß" → "SS").
-    */
-   private buildHeaderLines(width: number): string[] {
-      const theme = this.theme;
-      const label = this.header.trim().toUpperCase();
-      if (!label || width < HEADER_MIN_WIDTH) return [];
-
-      // Keep enough room for the rule; only give it all to the label when the
-      // row is too narrow for both.
-      const labelBudget = width - HEADER_LABEL_GAP - HEADER_MIN_RULE_WIDTH;
-      const maxLabelWidth = labelBudget >= 1 ? labelBudget : width;
-      const labelText = truncateToWidth(label, maxLabelWidth, "…");
-      const styledLabel = theme.fg("accent", theme.bold(labelText));
-
-      const ruleWidth = width - visibleWidth(labelText) - HEADER_LABEL_GAP;
-      if (ruleWidth < HEADER_MIN_RULE_WIDTH) return [styledLabel];
-      const rule = theme.fg("dim", "─".repeat(ruleWidth));
-      return [`${styledLabel}${" ".repeat(HEADER_LABEL_GAP)}${rule}`];
-   }
-
    private buildPromptLines(width: number): string[] {
-      return [...this.buildHeaderLines(width), ...this.buildQuestionLines(width)];
+      return this.buildQuestionLines(width);
    }
 
    private getOverlayHelpBudget(bodyCapacity: number, renderedHelpRows: number): number {
@@ -1483,6 +1502,17 @@ class AskComponent extends Container {
       this.updateHelpText();
    }
 
+   /**
+    * Leaving a batch page. A page left while its free-form editor is open keeps
+    * the typed text as a draft and returns to the option list, so coming back
+    * shows the draft on the numbered free-form row instead of the editor.
+    */
+   leavePage(): void {
+      if (this.mode === "freeform") {
+         this.showSelectMode();
+      }
+   }
+
    private ensureSingleSelectList(): WrappedSingleSelectList {
       if (this.singleSelectList) return this.singleSelectList;
 
@@ -1491,6 +1521,7 @@ class AskComponent extends Container {
          this.theme,
          this.singleSelectLayout,
          this.keybindings,
+         () => this.freeformDraft,
       );
       list.onSubmit = (result) => this.handleOptionSubmit(result);
       list.onCancel = () => this.onDone(null);
@@ -1507,6 +1538,7 @@ class AskComponent extends Container {
          this.options,
          this.theme,
          this.keybindings,
+         () => this.freeformDraft,
       );
       list.onCancel = () => this.onDone(null);
       list.onSubmit = (result) => this.handleMultiSubmit(result);
@@ -1535,6 +1567,10 @@ class AskComponent extends Container {
       const currentText = String(getText.call(this.editor) ?? "");
       if (this.mode === "freeform") {
          this.freeformDraft = currentText;
+         // The numbered free-form row shows the draft once one exists, so both
+         // lists must drop their cached rows when the draft changes.
+         this.singleSelectList?.invalidate();
+         this.multiSelectList?.invalidate();
       }
    }
 
@@ -1807,7 +1843,10 @@ class BatchAskComponent implements Component {
 
    private goTo(target: number): void {
       const previous = this.pages[this.current];
-      if (previous) previous.focused = false;
+      if (previous) {
+         previous.focused = false;
+         previous.leavePage();
+      }
       this.current = target;
       this.confirmingSkips = false;
       this.reviewScrollOffset = 0;
@@ -1818,16 +1857,18 @@ class BatchAskComponent implements Component {
    }
 
    private updateChrome(): void {
-      if (this.questions.length <= 1) {
-         this.title = "ask_user_question";
-         return;
-      }
+      // A single question keeps its own header as the frame title.
+      if (this.questions.length <= 1) return;
       const labels = this.questions.map((_, index) => {
          const label = `${index + 1}${this.answers[index] ? "✓" : ""}`;
          return index === this.current ? `[${label}]` : label;
       });
       const review = this.current === this.questions.length ? "[review]" : "review";
-      this.title = `ask_user_question ${labels.join(" ")} · ${review}`;
+      const strip = `${labels.join(" ")} · ${review}`;
+      // On a question page the strip follows that page's header; the review
+      // page belongs to no single question, so it shows the strip alone.
+      const current = this.questions[this.current];
+      this.title = current ? `${current.header} ${strip}` : strip;
       const hint = literalHint(this.theme, "tab/shift+tab", "questions");
       for (const page of this.pages) page.setBatchChrome(this.title, hint);
    }

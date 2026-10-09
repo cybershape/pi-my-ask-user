@@ -164,7 +164,7 @@ for (const failure of [new Error("UI failed"), "UI failed"]) {
 // Use the host's actual theme, TUI components, key parser, and cell-width calculation.
 // Only the terminal scheduling surface is inert; no real terminal is opened.
 const tuiPackage = pathToFileURL(findPackageJSON("@earendil-works/pi-tui", hostEntry));
-const { getKeybindings, visibleWidth } = await import(new URL("./dist/index.js", tuiPackage));
+const { getKeybindings, stripTerminalSequences, visibleWidth } = await import(new URL("./dist/index.js", tuiPackage));
 const { initTheme, theme } = await import(new URL("./modes/interactive/theme/theme.js", hostEntry));
 initTheme("dark");
 const errorLines = tool.renderResult(
@@ -173,10 +173,9 @@ const errorLines = tool.renderResult(
 ).render(80).join("\n");
 assert.ok(errorLines.includes("UI failed"));
 assert.ok(!errorLines.includes("Cancelled"));
-// Header eyebrow row: measured with the host's real cell-width logic, so wide
-// and fullwidth characters must keep the rule and the box border aligned.
-// Every frame row is padded to exactly `width` cells.
-await configure("singleSelectLayout", "list");
+// The question's `header` is the box's top-border title. It is measured with
+// the host's real cell-width logic, so CJK, fullwidth and emoji headers must
+// keep the corner glyphs aligned: every frame row is exactly `width` cells.
 for (const header of ["Group", "日本語ヘッダー", "ＡＢＣ全角", "café 😀 Mixed"]) {
    for (const width of [40, 80]) {
       await tool.execute("smoke-header", {
@@ -193,13 +192,16 @@ for (const header of ["Group", "日本語ヘッダー", "ＡＢＣ全角", "caf�
                for (const line of lines) {
                   assert.equal(visibleWidth(line), width, `header ${JSON.stringify(header)} row is not ${width} cells wide`);
                }
-               const headerRow = lines.find((line) => line.includes(header.toUpperCase()));
-               assert.ok(headerRow, `header ${JSON.stringify(header)} must be rendered uppercased`);
-               assert.ok(headerRow.includes("─"), `header ${JSON.stringify(header)} must draw its rule`);
-               // The question renders on a later row, below the header.
+               // The header is the border title, so it is on the first row and
+               // shown verbatim, with the question on a later row. The border
+               // carries colour, so compare its plain text.
+               const border = stripTerminalSequences(lines[0]);
+               assert.ok(border.startsWith("╭─ "), "top border must open with the corner and rule");
+               assert.ok(border.includes(header), `header ${JSON.stringify(header)} must be the border title`);
+               assert.ok(border.endsWith("╮"), `header ${JSON.stringify(header)} must keep the corner aligned`);
                assert.ok(
-                  lines.findIndex((line) => line.includes("Choose one")) > lines.indexOf(headerRow),
-                  `question must render below header ${JSON.stringify(header)}`,
+                  lines.findIndex((line) => line.includes("Choose one")) > 0,
+                  `question must render below the border title for ${JSON.stringify(header)}`,
                );
                return null;
             },
@@ -207,24 +209,56 @@ for (const header of ["Group", "日本語ヘッダー", "ＡＢＣ全角", "caf�
       });
    }
 }
-// Narrow widths: the label is truncated so the rule still fits, and the row is
-// dropped entirely below the minimum width. Either way the frame never widens.
+// An overflowing header is ellipsised rather than dropped or allowed to widen
+// the frame, and a prompt too narrow for any title falls back to a plain border.
 await tool.execute("smoke-header-narrow", {
-   questions: [{ question: "Choose one", header: "Deploy target", options: [option("Alpha", "first"), option("Beta", "second")] }],
+   questions: [{ question: "Choose one", header: "A very long header that will definitely overflow", options: [option("Alpha", "first"), option("Beta", "second")] }],
 }, undefined, undefined, {
    hasUI: true,
    ui: {
       custom: async (factory) => {
-         const page = factory(
+         const component = factory(
             { requestRender() {}, terminal: { rows: 40 } },
             theme, getKeybindings(), () => {},
-         ).pages[0];
-         const narrow = page.buildHeaderLines(8);
-         assert.equal(narrow.length, 1);
-         assert.equal(visibleWidth(narrow[0]), 8, "truncated header must still fill exactly the width");
-         assert.ok(narrow[0].includes("…"), "an overflowing label is ellipsised");
-         assert.ok(narrow[0].includes("─"), "the rule survives because the label gave way");
-         assert.deepEqual(page.buildHeaderLines(5), [], "below the minimum width the header row is dropped");
+         );
+         const [truncated] = component.render(40);
+         assert.equal(visibleWidth(truncated), 40, "truncated title must still fill exactly the width");
+         assert.ok(truncated.includes("…"), "an overflowing header is ellipsised");
+         const truncatedBorder = stripTerminalSequences(truncated);
+         assert.ok(
+            truncatedBorder.startsWith("╭") && truncatedBorder.endsWith("╮"),
+            "corners stay aligned when the title is truncated",
+         );
+
+         // width 6 -> inner 4, the smallest width that still frames a title.
+         assert.equal(visibleWidth(component.render(6)[0]), 6);
+         // width 5 -> inner 3, below the title minimum: plain border, no title.
+         assert.equal(stripTerminalSequences(component.render(5)[0]), "╭───╮",
+            "a prompt too narrow for a title falls back to a plain border");
+         return null;
+      },
+   },
+});
+// The free-form row is numbered like the options and shows a dim placeholder
+// plus hint while empty; every row still fills the frame exactly.
+await tool.execute("smoke-freeform-row", {
+   questions: [{ question: "Choose one", header: "Group", options: [option("Alpha", "first"), option("Beta", "second")] }],
+}, undefined, undefined, {
+   hasUI: true,
+   ui: {
+      custom: async (factory) => {
+         const component = factory(
+            { requestRender() {}, terminal: { rows: 40 } },
+            theme, getKeybindings(), () => {},
+         );
+         const lines = component.render(40);
+         for (const line of lines) {
+            assert.equal(visibleWidth(line), 40, "free-form row frame is not 40 cells wide");
+         }
+         const numbered = lines.find((line) => stripTerminalSequences(line).includes("3. Type something."));
+         assert.ok(numbered, "the free-form row must carry the next option number");
+         assert.ok(lines.some((line) => stripTerminalSequences(line).includes("Enter a custom response")),
+            "the empty free-form row must show its hint");
          return null;
       },
    },

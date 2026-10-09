@@ -18,7 +18,7 @@ High-quality video: [ask-user-demo.mp4](https://github.com/cybershape/pi-my-ask-
 - Responsive split-pane details preview on wide terminals, with a persistent single-column preference
 - Multi-select option lists
 - A unified `questions` array for 1-4 focused, independent questions, with a review page before submitting when asking multiple questions
-- A free-form answer is always offered alongside the listed options
+- A free-form answer is always offered alongside the listed options, numbered like them; until you type anything the row shows a dim `Type something.` placeholder with an `Enter a custom response` hint, and once you have a draft the row shows it
 - Configurable display mode: `inline` (rendered directly in the flow, default) or `overlay` (modal)
 - Globally persisted display, layout, shortcut and timeout preferences via `/ask-user-question-settings`
 - Runtime overlay toggle: press the configured overlay-toggle key (`alt+o` by default, configurable through settings or an env var) while an overlay prompt is open to temporarily hide/show the popup so you can read prior agent output, then press it again to bring it back
@@ -71,7 +71,7 @@ The registered tool name is:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `question` | `string` | required | One focused, non-empty question |
-| `header` | `string` | required | Short group label shown above the question. This is the field the answer is grouped under |
+| `header` | `string` | required | Short group label shown in the prompt's top border, above the question. Keep it brief — it is ellipsised when the terminal is too narrow for it |
 | `options` | `{label, description, preview?}[]` | required | 2-4 distinct options. `label` is the value returned when the user picks it; `description` is required; `preview` is an optional longer body shown in the wide details pane |
 | `multiSelect` | `boolean?` | `false` | Enable multi-select mode |
 

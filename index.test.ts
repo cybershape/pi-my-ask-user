@@ -871,6 +871,49 @@ describe("single-select UI", () => {
       expect(result.details.answers).toEqual([{ question: "Pick?", kind: "custom", answer: "Neither of those" }]);
    });
 
+   test("the free-form row is numbered and shows a placeholder while empty", async () => {
+      const tool = await setupTool();
+      editorText = "";
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", oneQuestion({ question: "Pick?", options: opts2("Red", "Blue") }), undefined, undefined, { hasUI: true, ui });
+      // Render narrow so the single-column list keeps the hint row; the wide
+      // split-pane layout hides descriptions by design.
+      const rendered = state.component.render(60).join("\n");
+      // Two options, so the free-form row carries number 3.
+      expect(rendered).toMatch(/3\.\s+Type something\./);
+      expect(rendered).toContain("Enter a custom response");
+      press(state.component, "escape");
+      await execution;
+   });
+
+   test("the free-form row shows the typed draft instead of the placeholder", async () => {
+      const tool = await setupTool();
+      editorText = "";
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", oneQuestion({ question: "Pick?", options: opts2("Red", "Blue") }), undefined, undefined, { hasUI: true, ui });
+      press(state.component, "down", "down", "enter"); // open the editor
+      editorText = "use syslog";
+      press(state.component, "escape");                // back to the list
+      const rendered = state.component.render(100).join("\n");
+      expect(rendered).toMatch(/3\.\s+use syslog/);
+      expect(rendered).not.toContain("Type something.");
+      expect(rendered).not.toContain("Enter a custom response");
+      press(state.component, "escape");
+      await execution;
+   });
+
+   test("the multi-select free-form row is numbered and shows a placeholder while empty", async () => {
+      const tool = await setupTool();
+      editorText = "";
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", oneQuestion({ question: "Pick?", options: [opt("A"), opt("B"), opt("C")], multiSelect: true }), undefined, undefined, { hasUI: true, ui });
+      const rendered = state.component.render(100).join("\n");
+      expect(rendered).toMatch(/4\.\s+Type something\./);
+      expect(rendered).toContain("Enter a custom response");
+      press(state.component, "escape");
+      await execution;
+   });
+
    test("ctrl+k at the top wraps to the free-form row", async () => {
       const tool = await setupTool();
       editorText = "";
@@ -917,56 +960,36 @@ describe("single-select UI", () => {
       expect(result.details.answers).toEqual([{ question: "Continue?", kind: "option", answer: "Red" }]);
    });
 
-   test("shows the header as an eyebrow row above the question", async () => {
+   test("shows the header in the frame title above the question", async () => {
       const tool = await setupTool();
       const { state, ui } = mountPrompt();
       const execution = tool.execute("id", oneQuestion({ question: "Pick?", header: "Deploy target" }), undefined, undefined, { hasUI: true, ui });
       const rendered = state.component.render(100).join("\n");
-      expect(rendered).toContain("DEPLOY TARGET");
-      // The header row sits directly above the question, rule filling the row.
-      expect(rendered.indexOf("DEPLOY TARGET")).toBeLessThan(rendered.indexOf("Pick?"));
-      expect(rendered).toMatch(/DEPLOY TARGET ─+/);
+      expect(rendered).toContain("Deploy target");
+      // The header is the border title, so it precedes the question and no
+      // separate header row is rendered.
+      expect(rendered.indexOf("Deploy target")).toBeLessThan(rendered.indexOf("Pick?"));
+      expect(rendered.indexOf("Deploy target")).toBeLessThan(rendered.indexOf("\n│ "));
       press(state.component, "enter");
       await execution;
    });
 
-   test("header rule is measured in cells so CJK and emoji stay aligned", async () => {
+   test("the frame title keeps the header verbatim instead of uppercasing it", async () => {
       const tool = await setupTool();
       const { state, ui } = mountPrompt();
-      const execution = tool.execute("id", oneQuestion({ header: "日本語ヘッダー" }), undefined, undefined, { hasUI: true, ui });
-      // 7 CJK cells wide each = 14 cells; inner width is 96 for a 100-wide frame.
-      const [row] = (state.component as any).pages[0].buildHeaderLines(96);
-      expect(row).toBe("日本語ヘッダー" + " " + "─".repeat(96 - 14 - 1));
-      expect([...row].filter((character) => character === "─")).toHaveLength(81);
+      const execution = tool.execute("id", oneQuestion({ header: "Deploy Target" }), undefined, undefined, { hasUI: true, ui });
+      const rendered = state.component.render(100).join("\n");
+      expect(rendered).toContain("Deploy Target");
+      expect(rendered).not.toContain("DEPLOY TARGET");
       press(state.component, "escape");
       await execution;
    });
 
-   test("header rule shrinks around wide characters instead of overflowing", async () => {
-      const tool = await setupTool();
-      const { state, ui } = mountPrompt();
-      const execution = tool.execute("id", oneQuestion({ header: "ＡＢＣ全角" }), undefined, undefined, { hasUI: true, ui });
-      const [row] = (state.component as any).pages[0].buildHeaderLines(40);
-      // "ＡＢＣ全角" is 5 fullwidth characters = 10 cells.
-      expect([...row].filter((character) => character === "─")).toHaveLength(40 - 10 - 1);
-      press(state.component, "escape");
-      await execution;
-   });
-
-   test("header row is dropped entirely below the minimum width", async () => {
-      const tool = await setupTool();
-      const { state, ui } = mountPrompt();
-      const execution = tool.execute("id", oneQuestion({ header: "Deploy target" }), undefined, undefined, { hasUI: true, ui });
-      const page = (state.component as any).pages[0];
-      expect(page.buildHeaderLines(6)).toHaveLength(1);
-      expect(page.buildHeaderLines(5)).toEqual([]);
-      press(state.component, "escape");
-      await execution;
-   });
-
-   // Label truncation and the real cell-width of CJK/emoji headers are asserted
-   // against the host's genuine pi-tui in scripts/host-smoke.mjs; the mocked
-   // truncateToWidth here is an identity function and cannot verify them.
+   // Border-title cell alignment for CJK, fullwidth and emoji headers, its
+   // truncation when overflowing, and the plain-border fallback on very narrow
+   // prompts are asserted against the host's genuine pi-tui in
+   // scripts/host-smoke.mjs. The mocked truncateToWidth here is an identity
+   // function, so those paths cannot be verified from this suite.
 });
 
 // ==========================================================================
@@ -1205,6 +1228,35 @@ describe("multi-question batch", () => {
       expect(result.details.answers).toEqual([{ question: "Only?", kind: "option", answer: "A" }]);
    });
 
+   test("leaving a page in the free-form editor returns it to the list with the draft on the row", async () => {
+      const tool = await setupTool();
+      editorText = "";
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", batch([
+         { question: "First?", options: opts2("A", "B") },
+         { question: "Second?", options: opts2("X", "Y") },
+      ]), undefined, undefined, { hasUI: true, ui });
+      // Open page 1's free-form editor and type a draft.
+      press(state.component, "down", "down", "enter");
+      editorText = "custom note";
+      // Switch away and back: the page must come back as the option list,
+      // not the editor, with the draft shown on its numbered free-form row.
+      press(state.component, "tab");
+      press(state.component, "shift+tab");
+      const page = (state.component as any).pages[0];
+      expect(page.mode).toBe("select");
+      expect(page.freeformDraft).toBe("custom note");
+      const rendered = state.component.render(100).join("\n");
+      expect(rendered).toMatch(/3\.\s+custom note/);
+      expect(rendered).not.toContain("Type something.");
+      // The draft still submits as a custom answer.
+      press(state.component, "enter", "enter"); // reopen editor, submit draft
+      press(state.component, "enter");          // answer page 2
+      press(state.component, "enter");          // review submit
+      const result = await execution;
+      expect(result.details.answers[0]).toEqual({ question: "First?", kind: "custom", answer: "custom note" });
+   });
+
    test("tab moves between pages and each page keeps its own option selection", async () => {
       const tool = await setupTool();
       const { state, ui } = mountPrompt();
@@ -1309,14 +1361,21 @@ describe("multi-question batch", () => {
       expect(selects[1]).toContain("(2/2) Second?");
    });
 
-   test("the batch title shows page progress", async () => {
+   test("the batch title shows the current header plus page progress", async () => {
       const tool = await setupTool();
       const { state, ui } = mountPrompt();
       const execution = tool.execute("id", batch([
-         { question: "First?", options: opts2() },
-         { question: "Second?", options: opts2() },
+         { question: "First?", header: "Storage", options: opts2() },
+         { question: "Second?", header: "Deploy", options: opts2() },
       ]), undefined, undefined, { hasUI: true, ui });
-      expect(state.component.render(120).join("\n")).toContain("ask_user_question");
+      const first = state.component.render(120).join("\n");
+      expect(first).toContain("Storage [1] 2 · review");
+      expect(first).not.toContain("ask_user_question");
+      press(state.component, "tab");
+      expect(state.component.render(120).join("\n")).toContain("Deploy 1 [2] · review");
+      press(state.component, "tab");
+      // The review page belongs to no single question, so it shows the strip only.
+      expect(state.component.render(120).join("\n")).toContain("1 2 · [review]");
       press(state.component, "escape");
       await execution;
    });
@@ -1501,7 +1560,7 @@ describe("constrained viewports", () => {
             },
          },
       });
-      expect(initialRendered.join("\n")).toContain("ROLLOUT");
+      expect(initialRendered.join("\n")).toContain("Rollout");
       expect(initialRendered.join("\n")).toContain("(1/5)");
       expect(lastOptionRendered.join("\n")).toContain("Option 4");
       expect(lastOptionRendered.join("\n")).toContain("(4/5)");

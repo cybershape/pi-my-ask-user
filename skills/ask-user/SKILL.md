@@ -54,7 +54,7 @@ The prompt shows only the `header`, the `question`, and the option labels and de
 Call `ask_user_question` with a required `questions` array. Use one entry for one decision:
 
 - `question`: concrete decision prompt
-- `header`: short group label shown above the question, e.g. `Storage`, `Deploy target`
+- `header`: short group label shown in the prompt's top border, above the question, e.g. `Storage`, `Deploy target`. Keep it brief; a long header is ellipsised on narrow terminals
 - `options`: **2-4** entries, each with a required `label` and a required `description`
   - `label` is the value returned when the user picks it, and must be unique within the question
   - `label` may not be `Other`, `Type something.`, or `Next` — the prompt adds its own free-form row
