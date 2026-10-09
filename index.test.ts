@@ -65,7 +65,12 @@ class MockEditor {
          editorInputs.push(data);
       }
       if (data === "enter") {
-         this.onSubmit?.(editorText);
+         // Mirror pi-tui's Editor.submitValue(): the buffer is cleared before
+         // onSubmit fires, so anything reading getText() afterwards sees an
+         // empty editor and must rely on the submitted text instead.
+         const result = editorText.trim();
+         editorText = "";
+         this.onSubmit?.(result);
       }
    }
    getText() {
@@ -902,13 +907,15 @@ describe("single-select UI", () => {
       await execution;
    });
 
-   test("the multi-select free-form row is numbered and shows a placeholder while empty", async () => {
+   test("the multi-select free-form row is numbered, tickable and shows a placeholder while empty", async () => {
       const tool = await setupTool();
       editorText = "";
       const { state, ui } = mountPrompt();
       const execution = tool.execute("id", oneQuestion({ question: "Pick?", options: [opt("A"), opt("B"), opt("C")], multiSelect: true }), undefined, undefined, { hasUI: true, ui });
-      const rendered = state.component.render(100).join("\n");
-      expect(rendered).toMatch(/4\.\s+Type something\./);
+      // Render narrow so the single-column list keeps the hint row; the wide
+      // split-pane layout hides descriptions by design.
+      const rendered = state.component.render(60).join("\n");
+      expect(rendered).toMatch(/4\.\s+\[ ]\s+Type something\./);
       expect(rendered).toContain("Enter a custom response");
       press(state.component, "escape");
       await execution;
@@ -970,6 +977,10 @@ describe("single-select UI", () => {
       // separate header row is rendered.
       expect(rendered.indexOf("Deploy target")).toBeLessThan(rendered.indexOf("Pick?"));
       expect(rendered.indexOf("Deploy target")).toBeLessThan(rendered.indexOf("\n│ "));
+      // A blank row separates the header from the question.
+      const rows: string[] = state.component.render(100);
+      const questionRow = rows.findIndex((line) => line.includes("Pick?"));
+      expect(rows[questionRow - 1]).toMatch(/^│\s*│$/);
       press(state.component, "enter");
       await execution;
    });
@@ -1015,16 +1026,178 @@ describe("multi-select UI", () => {
       expect(result.details.answers).toEqual([{ question: "Pick?", kind: "multi", answer: null, selected: ["B"] }]);
    });
 
-   test("the free-form row is available in multi-select mode", async () => {
+   test("the free-form editor records the draft on the ticked row instead of submitting", async () => {
       const tool = await setupTool();
       editorText = "";
       const { state, ui } = mountPrompt();
       const execution = tool.execute("id", oneQuestion({ question: "Pick?", options: [opt("A"), opt("B")], multiSelect: true }), undefined, undefined, { hasUI: true, ui });
       press(state.component, "down", "down", "enter"); // two options, then free-form
       editorText = "Something else";
+      press(state.component, "enter");                // records, does not submit
+      expect(state.settled).toBe(false);
+      const page = (state.component as any).pages[0];
+      expect(page.mode).toBe("select");
+      expect(page.freeformDraft).toBe("Something else");
+      const rendered = state.component.render(100).join("\n");
+      expect(rendered).toMatch(/3\.\s+\[✓\]\s+Something else/);
+      // Enter on the free-form row edits the text again, like single-select.
       press(state.component, "enter");
+      expect((state.component as any).pages[0].mode).toBe("freeform");
+      press(state.component, "escape");
+      // Confirming from an option row submits the custom text alone.
+      press(state.component, "up", "enter");
       const result = await execution;
       expect(result.details.answers).toEqual([{ question: "Pick?", kind: "custom", answer: "Something else" }]);
+   });
+
+   test("a ticked free-form draft joins ticked options as one multi answer", async () => {
+      const tool = await setupTool();
+      editorText = "";
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", oneQuestion({ question: "Pick?", options: [opt("A"), opt("B")], multiSelect: true }), undefined, undefined, { hasUI: true, ui });
+      press(state.component, "space");                 // tick A
+      press(state.component, "down", "down", "enter"); // free-form editor
+      editorText = "and also this";
+      press(state.component, "enter");                 // back to the list, row ticked
+      press(state.component, "up", "enter");           // confirm from an option row
+      const result = await execution;
+      expect(result.details.answers).toEqual([
+         { question: "Pick?", kind: "multi", answer: null, selected: ["A", "and also this"] },
+      ]);
+   });
+
+   test("unticking the free-form row keeps the draft but drops it from the answer", async () => {
+      const tool = await setupTool();
+      editorText = "";
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", oneQuestion({ question: "Pick?", options: [opt("A"), opt("B")], multiSelect: true }), undefined, undefined, { hasUI: true, ui });
+      press(state.component, "space");                 // tick A
+      press(state.component, "down", "down", "enter"); // free-form editor
+      editorText = "draft kept";
+      press(state.component, "enter");                 // row ticked with draft
+      press(state.component, "space");                 // untick the free-form row
+      press(state.component, "up", "enter");           // confirm from an option row
+      const result = await execution;
+      expect(result.details.answers).toEqual([
+         { question: "Pick?", kind: "multi", answer: null, selected: ["A"] },
+      ]);
+   });
+
+   test("a batch single-select page keeps its submitted free-form text when revisited", async () => {
+      const tool = await setupTool();
+      editorText = "";
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", batch([
+         { question: "First?", options: opts2("A", "B") },
+         { question: "Second?", options: opts2("X", "Y") },
+      ]), undefined, undefined, { hasUI: true, ui });
+      press(state.component, "down", "down", "enter"); // free-form editor on page 1
+      editorText = "use syslog";
+      press(state.component, "enter");                 // submits page 1, advances
+      press(state.component, "shift+tab");             // back to page 1
+      const page = (state.component as any).pages[0];
+      expect(page.mode).toBe("select");
+      expect(page.freeformDraft).toBe("use syslog");
+      expect(state.component.render(100).join("\n")).toMatch(/3\.\s+use syslog/);
+      press(state.component, "tab", "enter", "enter"); // answer page 2, submit review
+      const result = await execution;
+      expect(result.details.answers[0]).toEqual({ question: "First?", kind: "custom", answer: "use syslog" });
+   });
+
+   test("a batch multi-select page returns to the list with its draft after tabbing away and back", async () => {
+      const tool = await setupTool();
+      editorText = "";
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", batch([
+         { question: "First?", options: opts2("A", "B"), multiSelect: true },
+         { question: "Second?", options: opts2("X", "Y") },
+      ]), undefined, undefined, { hasUI: true, ui });
+      press(state.component, "down", "down", "enter"); // free-form editor on page 1
+      editorText = "use syslog";
+      press(state.component, "enter");                 // record on the ticked row
+      press(state.component, "tab");                   // away to page 2
+      press(state.component, "shift+tab");             // back to page 1
+      const page = (state.component as any).pages[0];
+      expect(page.mode).toBe("select");
+      expect(page.freeformDraft).toBe("use syslog");
+      const rendered = state.component.render(100).join("\n");
+      expect(rendered).toMatch(/3\.\s+\[✓\]\s+use syslog/);
+      press(state.component, "up", "enter");           // confirm page 1 from an option row
+      press(state.component, "enter");                 // answer page 2
+      press(state.component, "enter");                 // review submit
+      const result = await execution;
+      expect(result.details.answers[0]).toEqual({ question: "First?", kind: "custom", answer: "use syslog" });
+   });
+
+   async function renderMultiList(tool: RegisteredTool, options: any[], width: number, keys: string[] = []) {
+      let rendered = "";
+      await tool.execute("id", oneQuestion({ question: "Pick?", options, multiSelect: true }), undefined, undefined, {
+         hasUI: true,
+         ui: {
+            custom: async (factory: any) => {
+               const component = factory(
+                  { requestRender() { }, terminal: { rows: 24 } },
+                  createTheme(),
+                  createKeybindings(),
+                  () => { },
+               );
+               for (const key of keys) component.handleInput(key);
+               rendered = (component as any).pages[0].multiSelectList.render(width).join("\n");
+               return null;
+            },
+         },
+      });
+      return rendered;
+   }
+
+   test("wide multi-select shows a details pane like single-select", async () => {
+      const tool = await setupTool();
+      const rendered = await renderMultiList(tool, [
+         opt("Alpha", "The alpha option keeps the rollout conservative.", "A longer preview body for Alpha."),
+         opt("Beta", "The beta option favors faster iteration."),
+      ], 120);
+      expect(rendered).toContain("## Alpha");
+      expect(rendered).toContain("A longer preview body for Alpha.");
+      // The left column hides descriptions in the split pane.
+      expect(rendered).not.toContain("The alpha option keeps");
+   });
+
+   test("the multi-select details pane follows the focused option", async () => {
+      const tool = await setupTool();
+      const rendered = await renderMultiList(tool, [
+         opt("Alpha", "Alpha detail."),
+         opt("Beta", "Beta detail."),
+      ], 120, ["down"]);
+      expect(rendered).toContain("## Beta");
+      expect(rendered).toContain("Beta detail.");
+      expect(rendered).not.toContain("## Alpha");
+   });
+
+   test("the multi-select details pane shows the custom response preview on the free-form row", async () => {
+      const tool = await setupTool();
+      const rendered = await renderMultiList(tool, opts2(), 120, ["down", "down"]);
+      expect(rendered).toContain("Custom response");
+      expect(rendered).toContain("Open the editor to write **any** answer.");
+   });
+
+   test("narrow multi-select falls back to the single column with descriptions", async () => {
+      const tool = await setupTool();
+      const rendered = await renderMultiList(tool, [
+         opt("Alpha", "The alpha option keeps the rollout conservative."),
+         opt("Beta", "The beta option favors faster iteration."),
+      ], 60);
+      expect(rendered).toContain("The alpha option keeps the rollout conservative.");
+      expect(rendered).not.toContain("## Alpha");
+   });
+
+   test("singleSelectLayout list keeps wide multi-select in one column", async () => {
+      const tool = await setupTool({ singleSelectLayout: "list" });
+      const rendered = await renderMultiList(tool, [
+         opt("Alpha", "The alpha option stays below its title."),
+         opt("Beta", "The beta option stays below its title."),
+      ], 120);
+      expect(rendered).toContain("The alpha option stays below its title.");
+      expect(rendered).not.toContain("## Alpha");
    });
 });
 

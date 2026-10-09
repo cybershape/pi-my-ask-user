@@ -15,7 +15,7 @@ High-quality video: [ask-user-demo.mp4](https://github.com/cybershape/pi-my-ask-
 ## Features
 
 - Searchable single-select option lists with wrapped labels and descriptions
-- Responsive split-pane details preview on wide terminals, with a persistent single-column preference
+- Responsive split-pane details preview on wide terminals in both selection modes, with a persistent single-column preference
 - Multi-select option lists
 - A unified `questions` array for 1-4 focused, independent questions, with a review page before submitting when asking multiple questions
 - A free-form answer is always offered alongside the listed options, numbered like them; until you type anything the row shows a dim `Type something.` placeholder with an `Enter a custom response` hint, and once you have a draft the row shows it
@@ -169,7 +169,7 @@ Use `default` to remove a saved override and restore the environment/built-in fa
 | Setting | Built-in default | Description |
 |---------|------------------|-------------|
 | `displayMode` | `inline` | `inline` renders in the conversation flow; `overlay` opens a centered modal |
-| `singleSelectLayout` | `auto` | `auto` enables the details pane on wide terminals; `list` always shows descriptions below options |
+| `singleSelectLayout` | `auto` | Applies to both selection modes: `auto` enables the details pane on wide terminals; `list` always shows descriptions below options |
 | `overlayToggleKey` | `alt+o` | Hide/show the overlay; only used in overlay mode; `off` disables it |
 | `timeout` | `0` (disabled) | Whole-prompt deadline in milliseconds, across all questions and dialog stages; integer from 0 to 2147483647 |
 
@@ -202,7 +202,7 @@ While an `ask_user_question` prompt is open:
 | Key | Action |
 |-----|--------|
 | `alt+o` (configurable via `overlayToggleKey`) | Hide/show the overlay popup so you can read the agent's prior output. Available in `overlay` mode only. The first time you hide it, a notification reminds you which key brings it back. |
-| `enter` | Confirm the focused option or submit a free-form answer. In a batch, confirming records the answer; on the review page it submits. |
+| `enter` | Confirm the focused option or submit a free-form answer. On the free-form row it always opens (or reopens) the editor, in both selection modes. In a multi-select question the editor records its text on the ticked free-form row and returns to the list; confirming from an option row then submits the labels together with that text. In a batch, confirming records the answer; on the review page it submits. |
 | `esc` | Clear the search filter, leave the free-form editor, or cancel the prompt. In a batch, cancelling cancels every question. |
 | `↑` / `↓`, `ctrl+k` / `ctrl+j` | Navigate options. `ctrl+k` / `ctrl+j` (vim-style) work while typing in searchable prompts without disturbing the filter. On a batch's review page they scroll the answers. |
 | `tab` / `shift+tab` | In a batch of 2-4 questions, switch to the next/previous question or the review page. For a single question, use arrows, `tab`, or `ctrl+j` / `ctrl+k` to navigate options. |
@@ -255,7 +255,7 @@ One entry per question the user actually answered, in question order:
 | Situation | `kind` | `answer` | `selected` |
 |-----------|--------|----------|------------|
 | One option picked | `"option"` | the chosen `label` | omitted |
-| Several options picked | `"multi"` | `null` | the chosen labels |
+| Several options picked | `"multi"` | `null` | the chosen labels, plus the user's free text as the final entry when they also wrote one |
 | Free-form row used | `"custom"` | the typed text | omitted |
 
 Questions left unanswered on the review page are dropped rather than recorded, so `answers` can be shorter than `questions`. A cancelled prompt returns `{ answers: [], cancelled: true }`.

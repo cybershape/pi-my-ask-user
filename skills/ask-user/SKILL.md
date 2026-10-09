@@ -86,7 +86,7 @@ Avoid repetitive confirmation loops.
 - `question`: the question text it answers
 - `kind`: `option` (one label picked), `multi` (several labels picked), or `custom` (free-form row used)
 - `answer`: the chosen label, or the typed text for `custom`, or `null` for `multi`
-- `selected`: the chosen labels, present only for `multi`
+- `selected`: the chosen labels, present only for `multi`; when the user also wrote free text on the ticked free-form row it is appended as the final entry
 
 Questions the user left unanswered on the review page are dropped, so `answers` can be shorter
 than the questions you sent. Treat a missing answer as unanswered rather than as agreement.

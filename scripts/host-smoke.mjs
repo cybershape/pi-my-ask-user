@@ -199,10 +199,18 @@ for (const header of ["Group", "日本語ヘッダー", "ＡＢＣ全角", "caf�
                assert.ok(border.startsWith("╭─ "), "top border must open with the corner and rule");
                assert.ok(border.includes(header), `header ${JSON.stringify(header)} must be the border title`);
                assert.ok(border.endsWith("╮"), `header ${JSON.stringify(header)} must keep the corner aligned`);
-               assert.ok(
-                  lines.findIndex((line) => line.includes("Choose one")) > 0,
-                  `question must render below the border title for ${JSON.stringify(header)}`,
-               );
+               // The header reads in the normal text colour, not the dim shade
+               // used for the version tag. The border pads the title with
+               // spaces, so compare the padded form.
+               assert.ok(lines[0].includes(theme.fg("text", theme.bold(` ${header} `))),
+                  `header ${JSON.stringify(header)} must be rendered in the text colour`);
+               assert.ok(!lines[0].includes(theme.fg("dim", theme.bold(` ${header} `))),
+                  `header ${JSON.stringify(header)} must not be dimmed`);
+               // A blank row separates the header from the question.
+               const questionIndex = lines.findIndex((line) => line.includes("Choose one"));
+               assert.ok(questionIndex > 1, `question must sit below a blank row for ${JSON.stringify(header)}`);
+               assert.equal(stripTerminalSequences(lines[questionIndex - 1]).replace(/[│]/g, "").trim(), "",
+                  `the row above the question must be blank for ${JSON.stringify(header)}`);
                return null;
             },
          },

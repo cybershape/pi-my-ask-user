@@ -158,8 +158,10 @@ interface AskParams {
 type AskAnswerKind = "option" | "custom" | "multi";
 
 /**
- * One answer. `option` carries the chosen label in `answer`, `custom` the
- * free text the user typed, and `multi` `null` with the labels in `selected`.
+ * One answer. `option` carries the chosen label in `answer` and `custom` the
+ * free text the user typed. `multi` keeps `answer` null and lists everything
+ * the user picked in `selected`: the ticked labels plus, when they also wrote
+ * one, their free-form text as the final entry.
  */
 interface AskAnswer {
    question: string;
@@ -229,9 +231,15 @@ function createOptionResponse(label: string): AskUIResponse | null {
    return trimmed ? { kind: "option", answer: trimmed } : null;
 }
 
-function createMultiResponse(labels: string[]): AskUIResponse | null {
+function createMultiResponse(labels: string[], custom: string | null = null): AskUIResponse | null {
    const selected = labels.map((label) => label.trim()).filter(Boolean);
-   if (selected.length === 0) return null;
+   const text = custom?.trim() || null;
+   // Only written text is a plain custom answer; with ticked options the
+   // written text joins them as the final entry of `selected`.
+   if (selected.length === 0) {
+      return text ? { kind: "custom", answer: text } : null;
+   }
+   if (text) selected.push(text);
    return { kind: "multi", answer: null, selected };
 }
 
@@ -266,6 +274,37 @@ function createEditorTheme(theme: Theme): EditorTheme {
       borderColor: (s: string) => theme.fg("accent", s),
       selectList: createSelectListTheme(theme),
    };
+}
+
+/**
+ * Render a details pane as markdown, bounded to `maxLines` rows with an
+ * ellipsis marker when it overflows. Shared by both selection modes.
+ */
+function renderPreviewMarkdown(md: string, width: number, maxLines: number, theme: Theme): string[] {
+   if (maxLines <= 0) return [];
+
+   const mdTheme = safeMarkdownTheme();
+   let lines: string[];
+   if (mdTheme) {
+      const mdComponent = new Markdown(md.trim(), 0, 0, mdTheme);
+      lines = mdComponent.render(width);
+   } else {
+      lines = [];
+      for (const line of wrapTextWithAnsi(md.trim(), Math.max(10, width))) {
+         lines.push(truncateToWidth(line, width, ""));
+      }
+   }
+
+   while (lines.length > 0 && lines[lines.length - 1]?.trim() === "") {
+      lines.pop();
+   }
+
+   if (lines.length <= maxLines) return lines;
+   if (maxLines === 1) return [truncateToWidth(theme.fg("dim", "…"), width, "")];
+
+   const visibleLines = lines.slice(0, maxLines - 1);
+   visibleLines.push(truncateToWidth(theme.fg("dim", "…"), width, ""));
+   return visibleLines;
 }
 
 const BOX_BORDER_LEFT = "│ ";
@@ -401,6 +440,34 @@ const SINGLE_SELECT_SPLIT_PANE_MIN_WIDTH = 84;
 const SINGLE_SELECT_SPLIT_PANE_LEFT_MIN_WIDTH = 32;
 const SINGLE_SELECT_SPLIT_PANE_RIGHT_MIN_WIDTH = 28;
 const SINGLE_SELECT_SPLIT_PANE_SEPARATOR = " │ ";
+
+/**
+ * Split-pane geometry shared by both selection modes: a narrow option column
+ * on the left and a details pane on the right. `list` disables it, and widths
+ * below the minimum fall back to the single-column layout.
+ */
+function getSplitPaneWidths(
+   layout: AskSingleSelectLayout,
+   width: number,
+): { left: number; right: number } | null {
+   if (layout === "list") return null;
+   if (width < SINGLE_SELECT_SPLIT_PANE_MIN_WIDTH) return null;
+
+   const availableWidth = width - SINGLE_SELECT_SPLIT_PANE_SEPARATOR.length;
+   if (availableWidth < SINGLE_SELECT_SPLIT_PANE_LEFT_MIN_WIDTH + SINGLE_SELECT_SPLIT_PANE_RIGHT_MIN_WIDTH) {
+      return null;
+   }
+
+   const preferredLeftWidth = Math.floor(availableWidth * 0.42);
+   const left = Math.max(
+      SINGLE_SELECT_SPLIT_PANE_LEFT_MIN_WIDTH,
+      Math.min(preferredLeftWidth, availableWidth - SINGLE_SELECT_SPLIT_PANE_RIGHT_MIN_WIDTH),
+   );
+   const right = availableWidth - left;
+
+   if (right < SINGLE_SELECT_SPLIT_PANE_RIGHT_MIN_WIDTH) return null;
+   return { left, right };
+}
 const FREEFORM_SENTINEL = "\u270f\ufe0f Type custom response...";
 const DEFAULT_OVERLAY_TOGGLE_KEY = "alt+o";
 
@@ -482,12 +549,15 @@ class MultiSelectList implements Component {
    private keybindings: KeybindingsManager;
    private selectedIndex = 0;
    private checked = new Set<number>();
+   // Set once the user has written a free-form answer and returned to the
+   // list; the row then shows a tick and its draft joins the submitted answer.
+   private freeformChecked = false;
    private maxVisibleRows = 10;
    private cachedWidth?: number;
    private cachedLines?: string[];
 
    public onCancel?: () => void;
-   public onSubmit?: (result: string[]) => void;
+   public onSubmit?: (labels: string[], custom: string | null) => void;
    public onEnterFreeform?: () => void;
 
    constructor(
@@ -495,6 +565,7 @@ class MultiSelectList implements Component {
       theme: Theme,
       keybindings: KeybindingsManager,
       private getFreeformDraft: () => string,
+      private layout: AskSingleSelectLayout,
    ) {
       this.options = options;
       this.theme = theme;
@@ -530,6 +601,24 @@ class MultiSelectList implements Component {
       if (index < 0 || index >= this.options.length) return;
       if (this.checked.has(index)) this.checked.delete(index);
       else this.checked.add(index);
+   }
+
+   /** The free-form row carries a submitted draft that joins the answer. */
+   public isFreeformChecked(): boolean {
+      return this.freeformChecked;
+   }
+
+   public setFreeformChecked(value: boolean): void {
+      if (this.freeformChecked === value) return;
+      this.freeformChecked = value;
+      this.invalidate();
+   }
+
+   /** The custom text to submit, or null when the free-form row is unticked. */
+   private freeformText(): string | null {
+      if (!this.freeformChecked) return null;
+      const draft = this.getFreeformDraft().trim();
+      return draft || null;
    }
 
    handleInput(data: string): void {
@@ -569,7 +658,13 @@ class MultiSelectList implements Component {
 
       if (matchesKey(data, Key.space)) {
          if (this.isFreeformRow(this.selectedIndex)) {
-            this.onEnterFreeform?.();
+            // Ticking an empty free-form row opens the editor to write it;
+            // unticking keeps the draft but drops it from the answer.
+            if (!this.freeformChecked && !this.getFreeformDraft().trim()) {
+               this.onEnterFreeform?.();
+               return;
+            }
+            this.setFreeformChecked(!this.freeformChecked);
             return;
          }
          this.toggle(this.selectedIndex);
@@ -578,20 +673,27 @@ class MultiSelectList implements Component {
       }
 
       if (this.keybindings.matches(data, "tui.select.confirm")) {
+         // With the cursor on the free-form row, enter always edits the custom
+         // text, exactly like single-select; submitting happens from any other
+         // row so a written draft is never lost by an accidental enter.
          if (this.isFreeformRow(this.selectedIndex)) {
             this.onEnterFreeform?.();
             return;
          }
 
+         const custom = this.freeformText();
          const selectedLabels = Array.from(this.checked)
             .sort((a, b) => a - b)
             .map((i) => this.options[i]?.label)
             .filter((t): t is string => !!t);
 
-         const fallback = this.options[this.selectedIndex]?.label;
-         const result = selectedLabels.length > 0 ? selectedLabels : fallback ? [fallback] : [];
+         if (selectedLabels.length > 0 || custom) {
+            this.onSubmit?.(selectedLabels, custom);
+            return;
+         }
 
-         if (result.length > 0) this.onSubmit?.(result);
+         const fallback = this.options[this.selectedIndex]?.label;
+         if (fallback) this.onSubmit?.([fallback], null);
          else this.onCancel?.();
       }
    }
@@ -601,13 +703,63 @@ class MultiSelectList implements Component {
          return this.cachedLines;
       }
 
+      // Same split-pane geometry as single-select: options on the left, the
+      // focused item's details on the right. Narrow widths and the `list`
+      // layout fall back to the single column with descriptions.
+      const splitPane = getSplitPaneWidths(this.layout, width);
+      let lines: string[];
+
+      if (!splitPane) {
+         lines = this.buildListLines(width);
+      } else {
+         const listLines = this.buildListLines(splitPane.left, true);
+         const previewLines = this.buildPreviewLines(splitPane.right, this.maxVisibleRows);
+         const rowCount = Math.min(this.maxVisibleRows, Math.max(listLines.length, previewLines.length));
+         const separator = this.theme.fg("dim", SINGLE_SELECT_SPLIT_PANE_SEPARATOR);
+         lines = Array.from({ length: rowCount }, (_, index) => {
+            const left = truncateToWidth(listLines[index] ?? "", splitPane.left, "", true);
+            const right = truncateToWidth(previewLines[index] ?? "", splitPane.right, "");
+            return `${left}${separator}${right}`;
+         });
+      }
+
+      this.cachedWidth = width;
+      this.cachedLines = lines;
+      return lines;
+   }
+
+   private buildPreviewLines(width: number, maxLines: number): string[] {
+      let md = "";
+
+      if (this.isFreeformRow(this.selectedIndex)) {
+         md += "## Custom response\n\n";
+         md += "Open the editor to write **any** answer.\n\n";
+         md += "*Use this when none of the listed options fit.*\n";
+      } else {
+         const selected = this.options[this.selectedIndex];
+         if (!selected) {
+            md += "*No option selected*\n";
+         } else {
+            md += `## ${selected.label}\n\n`;
+            const detail = selected.preview?.trim() || selected.description?.trim();
+            if (detail) {
+               md += `${detail}\n`;
+            } else {
+               md += "*No additional details provided for this option.*\n";
+            }
+            md += `\n---\n\nPress \`space\` to toggle this option; it is currently **${this.checked.has(this.selectedIndex) ? "selected" : "not selected"}**.\n`;
+         }
+      }
+
+      return renderPreviewMarkdown(md, width, maxLines, this.theme);
+   }
+
+   private buildListLines(width: number, hideDescriptions = false): string[] {
       const theme = this.theme;
       const count = this.getItemCount();
 
       if (count === 0) {
-         this.cachedLines = [theme.fg("warning", "No options")];
-         this.cachedWidth = width;
-         return this.cachedLines;
+         return [theme.fg("warning", "No options")];
       }
 
       const blocks: string[][] = [];
@@ -620,18 +772,21 @@ class MultiSelectList implements Component {
          if (this.isFreeformRow(i)) {
             // The free-form row is numbered like the options. While it holds no
             // draft it shows a dim placeholder and hint, like an empty input
-            // field; once the user has typed something the row shows that text.
-            // The blank checkbox slot keeps its text aligned with option titles.
+            // field; once the user has written an answer the row shows that
+            // text and a tick, and the text joins the submitted answer.
             const draft = this.getFreeformDraft().trim();
             const num = theme.fg("dim", `${i + 1}.`);
+            const checkbox = this.freeformChecked
+               ? theme.fg("success", "[✓]")
+               : theme.fg("dim", "[ ]");
             const title = draft || FREEFORM_PLACEHOLDER;
             const styledTitle = isSelected
                ? theme.fg("accent", theme.bold(title))
                : draft
                   ? theme.fg("text", theme.bold(title))
                   : theme.fg("dim", title);
-            block.push(truncateToWidth(`${prefix} ${num}     ${styledTitle}`, width, ""));
-            if (!draft) {
+            block.push(truncateToWidth(`${prefix} ${num} ${checkbox} ${styledTitle}`, width, ""));
+            if (!draft && !hideDescriptions) {
                const indent = "      ";
                const wrapWidth = Math.max(10, width - indent.length);
                for (const wrapped of wrapTextWithAnsi(FREEFORM_HINT, wrapWidth)) {
@@ -653,7 +808,7 @@ class MultiSelectList implements Component {
          const firstLine = `${prefix} ${num} ${checkbox} ${title}`;
          block.push(truncateToWidth(firstLine, width, ""));
 
-         if (option.description) {
+         if (option.description && !hideDescriptions) {
             const indent = "      ";
             const wrapWidth = Math.max(10, width - indent.length);
             const wrapped = wrapTextWithAnsi(option.description, wrapWidth);
@@ -693,7 +848,7 @@ class MultiSelectList implements Component {
                const previousBlock = blocks[startIndex - 1];
                if (previousBlock && usedRows + previousBlock.length <= availableRows) {
                   startIndex -= 1;
-                  usedRows += previousBlock.length;
+                  usedRows += blocks[startIndex]!.length;
                   continue;
                }
 
@@ -708,8 +863,6 @@ class MultiSelectList implements Component {
          }
       }
 
-      this.cachedWidth = width;
-      this.cachedLines = lines;
       return lines;
    }
 }
@@ -836,23 +989,7 @@ class WrappedSingleSelectList implements Component {
    }
 
    private getSplitPaneWidths(width: number): { left: number; right: number } | null {
-      if (this.singleSelectLayout === "list") return null;
-      if (width < SINGLE_SELECT_SPLIT_PANE_MIN_WIDTH) return null;
-
-      const availableWidth = width - SINGLE_SELECT_SPLIT_PANE_SEPARATOR.length;
-      if (availableWidth < SINGLE_SELECT_SPLIT_PANE_LEFT_MIN_WIDTH + SINGLE_SELECT_SPLIT_PANE_RIGHT_MIN_WIDTH) {
-         return null;
-      }
-
-      const preferredLeftWidth = Math.floor(availableWidth * 0.42);
-      const left = Math.max(
-         SINGLE_SELECT_SPLIT_PANE_LEFT_MIN_WIDTH,
-         Math.min(preferredLeftWidth, availableWidth - SINGLE_SELECT_SPLIT_PANE_RIGHT_MIN_WIDTH),
-      );
-      const right = availableWidth - left;
-
-      if (right < SINGLE_SELECT_SPLIT_PANE_RIGHT_MIN_WIDTH) return null;
-      return { left, right };
+      return getSplitPaneWidths(this.singleSelectLayout, width);
    }
 
    private buildListLines(width: number, filteredOptions: QuestionOption[], hideDescriptions = false): string[] {
@@ -890,8 +1027,6 @@ class WrappedSingleSelectList implements Component {
    private buildPreviewLines(width: number, filteredOptions: QuestionOption[], maxLines: number): string[] {
       if (maxLines <= 0) return [];
 
-      const mdTheme = safeMarkdownTheme();
-
       let md = "";
 
       if (this.isFreeformRow(this.selectedIndex, filteredOptions)) {
@@ -920,27 +1055,7 @@ class WrappedSingleSelectList implements Component {
          }
       }
 
-      let lines: string[];
-      if (mdTheme) {
-         const mdComponent = new Markdown(md.trim(), 0, 0, mdTheme);
-         lines = mdComponent.render(width);
-      } else {
-         lines = [];
-         for (const line of wrapTextWithAnsi(md.trim(), Math.max(10, width))) {
-            lines.push(truncateToWidth(line, width, ""));
-         }
-      }
-
-      while (lines.length > 0 && lines[lines.length - 1]?.trim() === "") {
-         lines.pop();
-      }
-
-      if (lines.length <= maxLines) return lines;
-      if (maxLines === 1) return [truncateToWidth(this.theme.fg("dim", "…"), width, "")];
-
-      const visibleLines = lines.slice(0, maxLines - 1);
-      visibleLines.push(truncateToWidth(this.theme.fg("dim", "…"), width, ""));
-      return visibleLines;
+      return renderPreviewMarkdown(md, width, maxLines, this.theme);
    }
 
    handleInput(data: string): void {
@@ -1183,7 +1298,7 @@ class AskComponent extends Container {
 
       const bodyCapacity = Math.max(0, maxLines - 2);
       const helpFullLines = this.helpText.render(innerWidth);
-      const promptLines = this.buildPromptLines(innerWidth);
+      const promptLines = this.buildQuestionLines(innerWidth);
       const helpBudget = this.getOverlayHelpBudget(bodyCapacity, helpFullLines.length);
       const contentRows = Math.max(0, bodyCapacity - helpBudget);
 
@@ -1230,7 +1345,13 @@ class AskComponent extends Container {
          promptBudget += modeBudget - modeLines.length;
       }
 
-      const promptPaneLines = this.renderPromptPane(promptLines, promptBudget, innerWidth);
+      const promptPaneLines = this.renderPromptPane(
+         // The blank row under the header only joins the pane when the whole
+         // prompt still fits; on tight terminals the question keeps its row.
+         promptBudget >= promptLines.length + 1 ? ["", ...promptLines] : promptLines,
+         promptBudget,
+         innerWidth,
+      );
       const helpLines = this.limitLines(helpFullLines, helpBudget, innerWidth, false);
       const bodyLines = [
          ...promptPaneLines,
@@ -1247,9 +1368,9 @@ class AskComponent extends Container {
    }
 
    private buildPromptLines(width: number): string[] {
-      return this.buildQuestionLines(width);
+      // A blank row separates the header in the border from the question.
+      return ["", ...this.buildQuestionLines(width)];
    }
-
    private getOverlayHelpBudget(bodyCapacity: number, renderedHelpRows: number): number {
       if (renderedHelpRows <= 0 || bodyCapacity <= 0) return 0;
       if (bodyCapacity >= 12) return Math.min(2, renderedHelpRows);
@@ -1404,7 +1525,9 @@ class AskComponent extends Container {
       return new BoxBorderTop(
          (s: string) => this.theme.fg("accent", s),
          this.frameTitle,
-         (s: string) => this.theme.fg("dim", this.theme.bold(s)),
+         // The header is user content, so it reads in the normal text colour
+         // rather than the dim shade used for the version tag.
+         (s: string) => this.theme.fg("text", this.theme.bold(s)),
       ).render(width)[0] ?? "";
    }
 
@@ -1539,9 +1662,10 @@ class AskComponent extends Container {
          this.theme,
          this.keybindings,
          () => this.freeformDraft,
+         this.singleSelectLayout,
       );
       list.onCancel = () => this.onDone(null);
-      list.onSubmit = (result) => this.handleMultiSubmit(result);
+      list.onSubmit = (labels, custom) => this.handleMultiSubmit(labels, custom);
       list.onEnterFreeform = () => this.showFreeformMode();
 
       this.multiSelectList = list;
@@ -1586,14 +1710,36 @@ class AskComponent extends Container {
       this.onDone(createOptionResponse(label));
    }
 
-   private handleMultiSubmit(labels: string[]): void {
-      this.onDone(createMultiResponse(labels));
+   private handleMultiSubmit(labels: string[], custom: string | null): void {
+      this.onDone(createMultiResponse(labels, custom));
    }
 
    private handleEditorSubmit(text: string): void {
-      if (this.mode === "freeform") {
-         this.onDone(createCustomResponse(text));
+      if (this.mode !== "freeform") return;
+
+      // In a multi-select question the editor records the custom text on the
+      // ticked free-form row instead of submitting; the user confirms the
+      // combined answer from the option list.
+      if (this.multiSelect) {
+         this.showSelectMode();
+         // The editor clears its own buffer when it submits, so the text we
+         // received here is the authoritative draft: restore it after
+         // showSelectMode saved the now-empty editor.
+         this.freeformDraft = text;
+         const list = this.ensureMultiSelectList();
+         list.invalidate();
+         list.setFreeformChecked(!!text.trim());
+         return;
       }
+
+      // A single question resolves here, but in a batch the page stays alive:
+      // record the text on the row too, so returning to this page shows what
+      // was written instead of an empty placeholder. This must happen after
+      // onDone, because leaving the page saves the editor draft and the real
+      // editor has already cleared its buffer by then.
+      this.onDone(createCustomResponse(text));
+      this.freeformDraft = text;
+      this.singleSelectList?.invalidate();
    }
 
    private showSelectMode(): void {
@@ -1719,7 +1865,7 @@ function frameBox(theme: Theme, title: string, bodyLines: string[], width: numbe
    const innerWidth = Math.max(1, width - BOX_BORDER_OVERHEAD);
    const borderColor = (s: string) => theme.fg("accent", s);
    return [
-      new BoxBorderTop(borderColor, title, (s: string) => theme.fg("dim", theme.bold(s))).render(width)[0] ?? "",
+      new BoxBorderTop(borderColor, title, (s: string) => theme.fg("text", theme.bold(s))).render(width)[0] ?? "",
       ...bodyLines.map((line) => `${borderColor(BOX_BORDER_LEFT)}${truncateToWidth(line, innerWidth, "", true)}${borderColor(BOX_BORDER_RIGHT)}`),
       new BoxBorderBottom(borderColor, `v${ASK_USER_VERSION}`, (s: string) => theme.fg("dim", s)).render(width)[0] ?? "",
    ];

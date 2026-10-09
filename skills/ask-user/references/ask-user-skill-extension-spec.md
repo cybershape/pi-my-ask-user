@@ -150,7 +150,7 @@ Reading it:
 
 - `answers` holds one entry per question the user actually answered, in question order.
 - `kind: "option"` → `answer` is the chosen label.
-- `kind: "multi"` → `answer` is `null` and `selected` lists the chosen labels.
+- `kind: "multi"` → `answer` is `null` and `selected` lists the chosen labels; when the user also wrote free text on the ticked free-form row it is appended as the final entry of `selected`.
 - `kind: "custom"` → the user took the free-form row; `answer` is their typed text.
 - A question the user skipped on the review page is **dropped**, so `answers` can be shorter than `questions`. Treat a missing entry as unanswered, not as agreement.
 - `cancelled: true` with `answers: []` means the prompt was dismissed, timed out, or aborted.
