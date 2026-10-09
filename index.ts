@@ -37,6 +37,7 @@ import {
    Text,
    type TUI,
    truncateToWidth,
+   visibleWidth,
    wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { renderSingleSelectRows, type QuestionOption } from "./single-select-layout";
@@ -386,6 +387,12 @@ const SINGLE_SELECT_SPLIT_PANE_RIGHT_MIN_WIDTH = 28;
 const SINGLE_SELECT_SPLIT_PANE_SEPARATOR = " │ ";
 const FREEFORM_SENTINEL = "\u270f\ufe0f Type custom response...";
 const DEFAULT_OVERLAY_TOGGLE_KEY = "alt+o";
+// Header eyebrow row: `DEPLOY TARGET ─────────`. Below this width the row is
+// dropped entirely rather than shown as a truncated fragment.
+const HEADER_MIN_WIDTH = 6;
+// Cells between the label and its rule, and the narrowest rule worth drawing.
+const HEADER_LABEL_GAP = 1;
+const HEADER_MIN_RULE_WIDTH = 4;
 
 // Vim-style aliases for navigating option lists. ctrl+j/k are safe in the
 // searchable single-select because they don't collide with fuzzy-search input.
@@ -1010,7 +1017,6 @@ class AskComponent extends Container {
    private navigationHint: string | null = null;
 
    // Static layout components
-   private titleText: Text;
    private questionText: Text;
    private modeContainer: Container;
    private helpText: Text;
@@ -1065,10 +1071,6 @@ class AskComponent extends Container {
          "ask_user_question",
          (s: string) => theme.fg("dim", theme.bold(s)),
       ));
-      this.addChild(new Spacer(1));
-
-      this.titleText = new Text("", 1, 0);
-      this.addChild(this.titleText);
       this.addChild(new Spacer(1));
 
       this.questionText = new Text("", 1, 0);
@@ -1200,10 +1202,33 @@ class AskComponent extends Container {
       return this.questionText.render(width);
    }
 
+   /**
+    * The question's `header` as an eyebrow row above it: an uppercased label
+    * followed by a hairline rule filling the rest of the width. Both are
+    * measured in rendered cells, never code units, so CJK, fullwidth and emoji
+    * headers stay aligned with the box border. The label is uppercased before
+    * measuring because uppercasing can itself widen text ("ß" → "SS").
+    */
+   private buildHeaderLines(width: number): string[] {
+      const theme = this.theme;
+      const label = this.header.trim().toUpperCase();
+      if (!label || width < HEADER_MIN_WIDTH) return [];
+
+      // Keep enough room for the rule; only give it all to the label when the
+      // row is too narrow for both.
+      const labelBudget = width - HEADER_LABEL_GAP - HEADER_MIN_RULE_WIDTH;
+      const maxLabelWidth = labelBudget >= 1 ? labelBudget : width;
+      const labelText = truncateToWidth(label, maxLabelWidth, "…");
+      const styledLabel = theme.fg("accent", theme.bold(labelText));
+
+      const ruleWidth = width - visibleWidth(labelText) - HEADER_LABEL_GAP;
+      if (ruleWidth < HEADER_MIN_RULE_WIDTH) return [styledLabel];
+      const rule = theme.fg("dim", "─".repeat(ruleWidth));
+      return [`${styledLabel}${" ".repeat(HEADER_LABEL_GAP)}${rule}`];
+   }
+
    private buildPromptLines(width: number): string[] {
-      const headerLines = this.titleText.render(width);
-      const questionLines = this.buildQuestionLines(width);
-      return [...headerLines, "", ...questionLines];
+      return [...this.buildHeaderLines(width), ...this.buildQuestionLines(width)];
    }
 
    private getOverlayHelpBudget(bodyCapacity: number, renderedHelpRows: number): number {
@@ -1384,19 +1409,8 @@ class AskComponent extends Container {
       ];
    }
 
-   private frameRawLines(rawLines: string[], width: number, innerWidth: number): string[] {
-      const borderColor = (s: string) => this.theme.fg("accent", s);
-      return rawLines.map((line, index) => {
-         if (index === 0) return this.renderTopBorder(width);
-         if (index === rawLines.length - 1) return this.renderBottomBorder(width);
-         const padded = truncateToWidth(line, innerWidth, "", true);
-         return `${borderColor(BOX_BORDER_LEFT)}${padded}${borderColor(BOX_BORDER_RIGHT)}`;
-      });
-   }
-
    private updateStaticText(): void {
       const theme = this.theme;
-      this.titleText.setText(theme.fg("accent", theme.bold(this.header)));
       this.questionText.setText(theme.fg("text", theme.bold(this.question)));
    }
 

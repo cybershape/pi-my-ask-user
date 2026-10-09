@@ -173,6 +173,62 @@ const errorLines = tool.renderResult(
 ).render(80).join("\n");
 assert.ok(errorLines.includes("UI failed"));
 assert.ok(!errorLines.includes("Cancelled"));
+// Header eyebrow row: measured with the host's real cell-width logic, so wide
+// and fullwidth characters must keep the rule and the box border aligned.
+// Every frame row is padded to exactly `width` cells.
+await configure("singleSelectLayout", "list");
+for (const header of ["Group", "日本語ヘッダー", "ＡＢＣ全角", "café 😀 Mixed"]) {
+   for (const width of [40, 80]) {
+      await tool.execute("smoke-header", {
+         questions: [{ question: "Choose one", header, options: [option("Alpha", "first"), option("Beta", "second")] }],
+      }, undefined, undefined, {
+         hasUI: true,
+         ui: {
+            custom: async (factory) => {
+               const component = factory(
+                  { requestRender() {}, terminal: { rows: 40 } },
+                  theme, getKeybindings(), () => {},
+               );
+               const lines = component.render(width);
+               for (const line of lines) {
+                  assert.equal(visibleWidth(line), width, `header ${JSON.stringify(header)} row is not ${width} cells wide`);
+               }
+               const headerRow = lines.find((line) => line.includes(header.toUpperCase()));
+               assert.ok(headerRow, `header ${JSON.stringify(header)} must be rendered uppercased`);
+               assert.ok(headerRow.includes("─"), `header ${JSON.stringify(header)} must draw its rule`);
+               // The question renders on a later row, below the header.
+               assert.ok(
+                  lines.findIndex((line) => line.includes("Choose one")) > lines.indexOf(headerRow),
+                  `question must render below header ${JSON.stringify(header)}`,
+               );
+               return null;
+            },
+         },
+      });
+   }
+}
+// Narrow widths: the label is truncated so the rule still fits, and the row is
+// dropped entirely below the minimum width. Either way the frame never widens.
+await tool.execute("smoke-header-narrow", {
+   questions: [{ question: "Choose one", header: "Deploy target", options: [option("Alpha", "first"), option("Beta", "second")] }],
+}, undefined, undefined, {
+   hasUI: true,
+   ui: {
+      custom: async (factory) => {
+         const page = factory(
+            { requestRender() {}, terminal: { rows: 40 } },
+            theme, getKeybindings(), () => {},
+         ).pages[0];
+         const narrow = page.buildHeaderLines(8);
+         assert.equal(narrow.length, 1);
+         assert.equal(visibleWidth(narrow[0]), 8, "truncated header must still fill exactly the width");
+         assert.ok(narrow[0].includes("…"), "an overflowing label is ellipsised");
+         assert.ok(narrow[0].includes("─"), "the rule survives because the label gave way");
+         assert.deepEqual(page.buildHeaderLines(5), [], "below the minimum width the header row is dropped");
+         return null;
+      },
+   },
+});
 await configure("singleSelectLayout", "list");
 for (const label of ["Alpha", "日本語 😀 café"]) {
    const rendered = await tool.execute("smoke-tui", {

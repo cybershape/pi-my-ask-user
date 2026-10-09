@@ -178,6 +178,13 @@ beforeAll(() => {
       },
       Text: MockText,
       truncateToWidth: (text: string) => text,
+      // Mirrors pi-tui's cell counting closely enough for header layout tests:
+      // strip ANSI, then charge two cells for wide/fullwidth characters.
+      visibleWidth: (text: string) => [...text.replace(/\x1b\[[0-9;]*m/g, "")]
+         .reduce((total, character) => total + (
+            /[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE10-\uFE19\uFE30-\uFE6F\uFF00-\uFF60\uFFE0-\uFFE6]/.test(character)
+            || [...character].every((unit) => unit.codePointAt(0)! > 0xFFFF) ? 2 : 1
+         ), 0),
       wrapTextWithAnsi: (text: string, width = 80) => wrapPlainText(text, width),
       decodeKittyPrintable: (data: string) => (data.length === 1 ? data : undefined),
       fuzzyFilter: <T>(items: T[], query: string, getText: (item: T) => string) => {
@@ -910,14 +917,56 @@ describe("single-select UI", () => {
       expect(result.details.answers).toEqual([{ question: "Continue?", kind: "option", answer: "Red" }]);
    });
 
-   test("shows the header as the prompt title", async () => {
+   test("shows the header as an eyebrow row above the question", async () => {
       const tool = await setupTool();
       const { state, ui } = mountPrompt();
       const execution = tool.execute("id", oneQuestion({ question: "Pick?", header: "Deploy target" }), undefined, undefined, { hasUI: true, ui });
-      expect(state.component.render(100).join("\n")).toContain("Deploy target");
+      const rendered = state.component.render(100).join("\n");
+      expect(rendered).toContain("DEPLOY TARGET");
+      // The header row sits directly above the question, rule filling the row.
+      expect(rendered.indexOf("DEPLOY TARGET")).toBeLessThan(rendered.indexOf("Pick?"));
+      expect(rendered).toMatch(/DEPLOY TARGET ─+/);
       press(state.component, "enter");
       await execution;
    });
+
+   test("header rule is measured in cells so CJK and emoji stay aligned", async () => {
+      const tool = await setupTool();
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", oneQuestion({ header: "日本語ヘッダー" }), undefined, undefined, { hasUI: true, ui });
+      // 7 CJK cells wide each = 14 cells; inner width is 96 for a 100-wide frame.
+      const [row] = (state.component as any).pages[0].buildHeaderLines(96);
+      expect(row).toBe("日本語ヘッダー" + " " + "─".repeat(96 - 14 - 1));
+      expect([...row].filter((character) => character === "─")).toHaveLength(81);
+      press(state.component, "escape");
+      await execution;
+   });
+
+   test("header rule shrinks around wide characters instead of overflowing", async () => {
+      const tool = await setupTool();
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", oneQuestion({ header: "ＡＢＣ全角" }), undefined, undefined, { hasUI: true, ui });
+      const [row] = (state.component as any).pages[0].buildHeaderLines(40);
+      // "ＡＢＣ全角" is 5 fullwidth characters = 10 cells.
+      expect([...row].filter((character) => character === "─")).toHaveLength(40 - 10 - 1);
+      press(state.component, "escape");
+      await execution;
+   });
+
+   test("header row is dropped entirely below the minimum width", async () => {
+      const tool = await setupTool();
+      const { state, ui } = mountPrompt();
+      const execution = tool.execute("id", oneQuestion({ header: "Deploy target" }), undefined, undefined, { hasUI: true, ui });
+      const page = (state.component as any).pages[0];
+      expect(page.buildHeaderLines(6)).toHaveLength(1);
+      expect(page.buildHeaderLines(5)).toEqual([]);
+      press(state.component, "escape");
+      await execution;
+   });
+
+   // Label truncation and the real cell-width of CJK/emoji headers are asserted
+   // against the host's genuine pi-tui in scripts/host-smoke.mjs; the mocked
+   // truncateToWidth here is an identity function and cannot verify them.
 });
 
 // ==========================================================================
@@ -1452,7 +1501,7 @@ describe("constrained viewports", () => {
             },
          },
       });
-      expect(initialRendered.join("\n")).toContain("Rollout");
+      expect(initialRendered.join("\n")).toContain("ROLLOUT");
       expect(initialRendered.join("\n")).toContain("(1/5)");
       expect(lastOptionRendered.join("\n")).toContain("Option 4");
       expect(lastOptionRendered.join("\n")).toContain("(4/5)");
