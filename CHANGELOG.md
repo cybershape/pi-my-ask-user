@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.20.0](https://github.com/cybershape/pi-my-ask-user/releases/tag/v0.20.0) - 2026-10-09
+
+### Removed
+
+- BREAKING: the `ask_user` tool is now `ask_user_question`, and its input and result contracts changed completely.
+- BREAKING: the per-question `context` field, the `allowMultiple` field (replaced by `multiSelect`), and the `allowFreeform` and `allowComment` parameters. A free-form answer row is always offered, so it needs no toggle.
+- BREAKING: the `contextExpanded` and `commentToggleKey` settings, the `PI_ASK_USER_CONTEXT_EXPANDED`, `PI_ASK_USER_ALLOW_COMMENT`, `PI_ASK_USER_COMMENT_TOGGLE_KEY` and `PI_ASK_USER_EMIT_FULL_EVENTS` environment variables, and the context collapse UI with its `ctrl+e` toggle.
+- BREAKING: the `ask:answered` and `ask:cancelled` events. The tool no longer publishes answers; read them from the tool result. The `herdr:blocked` lifecycle events are unchanged.
+- BREAKING: the old result shape `{ kind: "batch", questions, answers: [{ status, response }], cancelled }`. Results are now `{ answers: [{ question, kind, answer, selected? }], cancelled, error? }`.
+
+### Added
+
+- `header` on every question: a required short group label. It is shown as the box's top-border title in the normal text colour, with a blank row between it and the question. A batch page shows the current page's header followed by the progress strip; the review page shows the strip alone.
+- `preview` on options: an optional longer body shown in the wide details pane, preferred over `description` there.
+- The free-form row is numbered like the options. While it holds no draft it shows a dim `Type something.` placeholder with a dim `Enter a custom response` hint; once the user has written something the row shows that text.
+- Multi-select questions use the same split-pane layout as single-select on wide terminals: options on the left, the focused item's details on the right. `singleSelectLayout: list` and narrow widths keep the single column with descriptions.
+- In a multi-select question, confirming the free-form editor records the text on a ticked free-form row and returns to the option list instead of submitting; confirming from an option row then submits the ticked labels with the written text appended as the final `selected` entry. Enter on the free-form row always reopens the editor, in both selection modes.
+- Strict input validation before any UI opens: unique question text, non-empty `header`, 2-4 options each with a required `label` and `description`, unique labels per question, and the reserved labels `Other`, `Type something.` and `Next`. Counts use `minItems`/`maxItems` in the flat schema; the rest runs in code because JSON Schema cannot express them.
+
+### Changed
+
+- BREAKING: each `questions` entry now requires `question`, `header` and `options` (2-4 entries of `{ label, description, preview? }`), with optional `multiSelect`. `questions` remains the only top-level parameter.
+- BREAKING: answers report `{ question, kind, answer, selected? }` where `kind` is `option` (label in `answer`), `custom` (typed text in `answer`) or `multi` (`answer` null, labels in `selected`). Questions skipped on the review page are dropped from `answers` instead of being recorded.
+- The settings command is `/ask-user-question-settings` and manages four settings: `displayMode`, `singleSelectLayout`, `overlayToggleKey`, `timeout`. The settings file `ask-user-settings.json` and the remaining `PI_ASK_USER_*` environment variables keep their names, so existing configuration still loads.
+
+### Fixed
+
+- Box borders measured their title with string length instead of rendered cells, so a CJK, fullwidth or emoji header pushed the corner out of the frame. Both borders now measure with `visibleWidth`, and an overflowing title is ellipsised instead of being dropped.
+- The question header was assigned to a child the renderer never walked, so it was invisible.
+- An option without a `description` was silently accepted with an empty one; it is now rejected as malformed.
+- A single-select page revisited after submitting its free-form answer showed an empty placeholder instead of the written text, because the editor clears its buffer on submit.
+- Leaving a batch page while its free-form editor was open kept the editor open; the page now returns to the option list with the draft on its row.
+
 ## [0.16.0](https://github.com/edlsh/pi-ask-user/releases/tag/v0.16.0) - 2026-10-02
 
 ### Added
