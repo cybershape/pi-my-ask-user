@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.21.0](https://github.com/cybershape/pi-my-ask-user/releases/tag/v0.21.0) - 2026-10-10
+
+### Changed
+
+- The bundled skill is now `ask-before-acting`. It only says when to stop, what to write before the call, and how to read the result. `/skill:ask-user` and `skills/ask-user/references/ask-user-skill-extension-spec.md` are gone.
+- `ask_user_question`'s description, prompt snippet, guidelines, and parameter descriptions no longer repeat the schema. The guidelines only cover when to ask, where fields go, the reserved option labels, and independent questions.
+
 ## [0.20.0](https://github.com/cybershape/pi-my-ask-user/releases/tag/v0.20.0) - 2026-10-09
 
 ### Removed
