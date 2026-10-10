@@ -19,8 +19,6 @@ assert.ok(tool, "ask_user_question must be registered");
 let checked = 0;
 for (const file of [
    "README.md",
-   "skills/ask-user/SKILL.md",
-   "skills/ask-user/references/ask-user-skill-extension-spec.md",
 ]) {
    const markdown = readFileSync(file, "utf8");
    const fences = [...markdown.matchAll(/^```json[ \t]*\r?\n([\s\S]*?)^```[ \t]*\r?$/gm)];

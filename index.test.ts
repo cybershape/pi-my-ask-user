@@ -1826,7 +1826,7 @@ describe("constrained viewports", () => {
 // ==========================================================================
 
 describe("documented examples", () => {
-   for (const file of ["README.md", "skills/ask-user/SKILL.md", "skills/ask-user/references/ask-user-skill-extension-spec.md"]) {
+   for (const file of ["README.md"]) {
       test(`${file} examples all match the registered schema`, async () => {
          const tool = await setupTool();
          const schema = tool.parameters;

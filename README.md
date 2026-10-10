@@ -29,11 +29,11 @@ High-quality video: [ask-user-demo.mp4](https://github.com/cybershape/pi-my-ask-
 - `herdr:blocked` lifecycle events while waiting for interactive input
 - Structured answer and cancellation `details` for session state reconstruction
 - Graceful fallback when interactive UI is unavailable
-- Bundled `ask-user` skill for mandatory decision-gating in high-stakes or ambiguous tasks
+- Bundled `ask-before-acting` skill for mandatory decision-gating in high-stakes or ambiguous tasks
 
-## Bundled skill: `ask-user`
+## Bundled skill: `ask-before-acting`
 
-This package now ships a skill at `skills/ask-user/SKILL.md` that nudges/mandates the agent to use `ask_user_question` when:
+This package now ships a skill at `skills/ask-before-acting/SKILL.md` that nudges/mandates the agent to use `ask_user_question` when:
 
 - architectural trade-offs are high impact
 - requirements are ambiguous or conflicting
@@ -45,8 +45,6 @@ The skill follows a "decision handshake" flow:
 2. Ask one focused question via `ask_user_question`
 3. Wait for explicit user choice
 4. Confirm the decision, then proceed
-
-See: `skills/ask-user/references/ask-user-skill-extension-spec.md`.
 
 ## Install
 

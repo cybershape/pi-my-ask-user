@@ -2601,10 +2601,10 @@ export default function(pi: ExtensionAPI) {
    // Codex-style backends, cmux), leaving the model to guess the shape
    // and produce empty options. See issue #22.
    const optionSchema = Type.Object({
-      label: Type.String({ description: "Short label for this option. This is the value returned when the user picks it." }),
-      description: Type.String({ description: "One line explaining what choosing this option means" }),
+      label: Type.String({ description: "Value returned when the user picks it. Unique within the question." }),
+      description: Type.String({ description: "One line on what choosing it means." }),
       preview: Type.Optional(
-         Type.String({ description: "Optional longer preview shown beside this option on wide terminals" }),
+         Type.String({ description: "Optional longer text shown beside the option on a wide terminal." }),
       ),
    });
 
@@ -2616,17 +2616,14 @@ export default function(pi: ExtensionAPI) {
       name: "ask_user_question",
       label: "Ask User Question",
       description:
-         "Ask the user 1-4 focused multiple-choice questions. Each question needs a header, a question, and 2-4 options with a label and a description. The user can always pick a free-form answer instead of the listed options. Multiple questions must be independent with settled prerequisites.",
+         "Ask the user 1-4 focused multiple-choice questions, and wait for the choice.",
       promptSnippet:
-         "Ask the user 1-4 focused questions, each with 2-4 labelled options",
+         "Ask the user a focused multiple-choice question",
       promptGuidelines: [
-         "Use ask_user_question when the user's intent is ambiguous, when a decision requires explicit user input, or when multiple valid options exist.",
-         "Always use the questions array, with one focused question by default. Never pass question, header, options, or multiSelect at the top level.",
-         "Every question needs a short header, the question text, and 2-4 options. Give each option a distinct label plus a description of its trade-off. The prompt adds its own free-form row, so never label an option \"Other\", \"Type something.\", or \"Next\".",
-         "Set multiSelect only when the user may legitimately pick several options at once.",
-         "When questions contains 2-4 entries, use it only for independent decisions whose prerequisites are already settled; ask anything that depends on another answer in a later ask_user_question call.",
-         "Do not combine multiple numbered, multipart, or unrelated questions into one question's text.",
-         "Display, layout, shortcuts and timeout are user settings managed by /ask-user-question-settings, not tool parameters. Do not pass them to ask_user_question.",
+         "Use ask_user_question only when the next step depends on a user decision you cannot resolve from the task or the code.",
+         "Put question, header, options, and multiSelect on each questions entry, never at the top level.",
+         "The prompt always adds a free-form row, so never label an option \"Other\", \"Type something.\", or \"Next\".",
+         "Ask one decision per question. Questions in one call must be independent; a decision that depends on another answer belongs in a later call.",
       ],
       // Block other tool calls in the same assistant turn until the user answers,
       // so the model can't batch ask_user_question with bash/edit/write and let those run
@@ -2635,24 +2632,24 @@ export default function(pi: ExtensionAPI) {
       parameters: Type.Object({
          questions: Type.Array(
             Type.Object({
-               question: Type.String({ description: "One focused question to ask the user" }),
-               header: Type.String({ description: "Short group label shown above the question" }),
+               question: Type.String({ description: "One decision for the user to make." }),
+               header: Type.String({ description: "Short label shown above the question." }),
                options: Type.Array(
                   optionSchema,
                   {
                      minItems: BATCH_MIN_OPTIONS,
                      maxItems: BATCH_MAX_OPTIONS,
-                     description: "2-4 distinct options for this question. The prompt always adds its own free-form choice, so do not add one here.",
+                     description: "Distinct choices for this question.",
                   },
                ),
                multiSelect: Type.Optional(
-                  Type.Boolean({ description: "Allow selecting multiple options. Default: false" }),
+                  Type.Boolean({ description: "True only when several options may be chosen together." }),
                ),
             }),
             {
                minItems: BATCH_MIN_QUESTIONS,
                maxItems: BATCH_MAX_QUESTIONS,
-               description: "Required array of 1-4 focused questions, even when asking only one. Set question, header, options, and multiSelect on each entry.",
+               description: "One entry per question, including when asking only one.",
             },
          ),
       }, { additionalProperties: false }),
